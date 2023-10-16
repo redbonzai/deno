@@ -3,6 +3,7 @@
 use deno_core::url::Url;
 use test_util as util;
 use util::assert_contains;
+use util::assert_not_contains;
 use util::env_vars_for_npm_tests;
 use util::wildcard_match;
 use util::TestContext;
@@ -88,6 +89,11 @@ itest!(test_with_malformed_config {
   args: "test --config test/collect/deno.malformed.jsonc",
   exit_code: 1,
   output: "test/collect_with_malformed_config.out",
+});
+
+itest!(test_filtered_out_only {
+  args: "test --quiet --filter foo test/filtered_out_only.ts",
+  output: "test/filtered_out_only.out",
 });
 
 itest!(parallel_flag {
@@ -176,7 +182,7 @@ itest!(quiet {
 });
 
 itest!(fail_fast {
-  args: "test --fail-fast test/fail_fast.ts",
+  args: "test --fail-fast test/fail_fast.ts test/fail_fast_other.ts",
   exit_code: 1,
   output: "test/fail_fast.out",
 });
@@ -249,6 +255,12 @@ itest!(trace_ops_catch_error {
 //  output: "test/ops_sanitizer_missing_details.out",
 // });
 
+itest!(ops_sanitizer_closed_inside_started_before {
+  args: "test --trace-ops test/ops_sanitizer_closed_inside_started_before.ts",
+  exit_code: 1,
+  output: "test/ops_sanitizer_closed_inside_started_before.out",
+});
+
 itest!(ops_sanitizer_nexttick {
   args: "test --no-check test/ops_sanitizer_nexttick.ts",
   output: "test/ops_sanitizer_nexttick.out",
@@ -266,10 +278,21 @@ itest!(exit_sanitizer {
   exit_code: 1,
 });
 
+itest!(junit {
+  args: "test --reporter junit test/pass.ts",
+  output: "test/pass.junit.out",
+});
+
 itest!(clear_timeout {
   args: "test test/clear_timeout.ts",
   exit_code: 0,
   output: "test/clear_timeout.out",
+});
+
+itest!(hide_empty_suites {
+  args: "test --filter none test/pass.ts",
+  exit_code: 0,
+  output: "test/hide_empty_suites.out",
 });
 
 itest!(finally_timeout {
@@ -330,6 +353,43 @@ itest!(steps_ignored_steps {
   args: "test test/steps/ignored_steps.ts",
   exit_code: 0,
   output: "test/steps/ignored_steps.out",
+});
+
+itest!(steps_dot_passing_steps {
+  args: "test --reporter=dot test/steps/passing_steps.ts",
+  exit_code: 0,
+  output: "test/steps/passing_steps.dot.out",
+});
+
+itest!(steps_dot_failing_steps {
+  args: "test --reporter=dot test/steps/failing_steps.ts",
+  exit_code: 1,
+  output: "test/steps/failing_steps.dot.out",
+});
+
+itest!(steps_dot_ignored_steps {
+  args: "test --reporter=dot test/steps/ignored_steps.ts",
+  exit_code: 0,
+  output: "test/steps/ignored_steps.dot.out",
+});
+
+itest!(steps_tap_passing_steps {
+  args: "test --reporter=tap test/steps/passing_steps.ts",
+  exit_code: 0,
+  output: "test/steps/passing_steps.tap.out",
+});
+
+itest!(steps_tap_failing_steps {
+  args: "test --reporter=tap test/steps/failing_steps.ts",
+  exit_code: 1,
+  envs: vec![("NO_COLOR".to_owned(), "1".to_owned())],
+  output: "test/steps/failing_steps.tap.out",
+});
+
+itest!(steps_tap_ignored_steps {
+  args: "test --reporter=tap test/steps/ignored_steps.ts",
+  exit_code: 0,
+  output: "test/steps/ignored_steps.tap.out",
 });
 
 itest!(steps_invalid_usage {
@@ -510,6 +570,11 @@ itest!(test_no_lock {
   output: "lockfile/basic/test.nolock.out",
 });
 
+itest!(test_replace_timers {
+  args: "test test/replace_timers.js",
+  output: "test/replace_timers.js.out",
+});
+
 #[test]
 fn test_with_glob_config() {
   let context = TestContextBuilder::new().cwd("test").build();
@@ -565,4 +630,19 @@ fn test_with_glob_config_and_flags() {
   let output = cmd_output.combined_output();
   assert_contains!(output, "glob/data/test1.js");
   assert_contains!(output, "glob/data/test1.ts");
+}
+
+#[test]
+fn conditionally_loads_type_graph() {
+  let context = TestContext::default();
+  let output = context
+    .new_command()
+    .args("test --reload -L debug run/type_directives_js_main.js")
+    .run();
+  output.assert_matches_text("[WILDCARD] - FileFetcher::fetch() - specifier: file:///[WILDCARD]/subdir/type_reference.d.ts[WILDCARD]");
+  let output = context
+    .new_command()
+    .args("test --reload -L debug --no-check run/type_directives_js_main.js")
+    .run();
+  assert_not_contains!(output.combined_output(), "type_reference.d.ts");
 }

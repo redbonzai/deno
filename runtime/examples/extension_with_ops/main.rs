@@ -4,23 +4,17 @@ use std::path::Path;
 use std::rc::Rc;
 
 use deno_core::error::AnyError;
-use deno_core::op;
+use deno_core::op2;
 use deno_core::FsModuleLoader;
 use deno_core::ModuleSpecifier;
 use deno_runtime::permissions::PermissionsContainer;
 use deno_runtime::worker::MainWorker;
 use deno_runtime::worker::WorkerOptions;
 
-deno_core::extension!(
-  hello_runtime,
-  ops = [op_hello],
-  customizer = |ext: &mut deno_core::ExtensionBuilder| {
-    ext.force_op_registration();
-  },
-);
+deno_core::extension!(hello_runtime, ops = [op_hello]);
 
-#[op]
-fn op_hello(text: &str) {
+#[op2(fast)]
+fn op_hello(#[string] text: &str) {
   println!("Hello {}!", text);
 }
 

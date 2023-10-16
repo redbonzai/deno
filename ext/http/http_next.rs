@@ -1,6 +1,7 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 use crate::compressible::is_content_compressible;
 use crate::extract_network_stream;
+use crate::hyper_util_tokioio::TokioIo;
 use crate::network_buffered_stream::NetworkStreamPrefixCheck;
 use crate::request_body::HttpRequestBody;
 use crate::request_properties::HttpConnectionProperties;
@@ -9,25 +10,30 @@ use crate::request_properties::HttpPropertyExtractor;
 use crate::response_body::Compression;
 use crate::response_body::ResponseBytes;
 use crate::response_body::ResponseBytesInner;
-use crate::response_body::V8StreamHttpResponseBody;
-use crate::slab::slab_drop;
+use crate::slab::new_slab_future;
 use crate::slab::slab_get;
-use crate::slab::slab_insert;
+use crate::slab::slab_init;
+use crate::slab::HttpRequestBodyAutocloser;
+use crate::slab::RefCount;
 use crate::slab::SlabId;
 use crate::websocket_upgrade::WebSocketUpgrade;
 use crate::LocalExecutor;
 use cache_control::CacheControl;
 use deno_core::error::AnyError;
 use deno_core::futures::TryFutureExt;
-use deno_core::op;
-use deno_core::task::spawn;
-use deno_core::task::JoinHandle;
+use deno_core::op2;
+use deno_core::serde_v8::from_v8;
+use deno_core::unsync::spawn;
+use deno_core::unsync::JoinHandle;
+use deno_core::v8;
 use deno_core::AsyncRefCell;
 use deno_core::AsyncResult;
+use deno_core::BufView;
 use deno_core::ByteString;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::CancelTryFuture;
+use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
@@ -51,33 +57,33 @@ use hyper1::server::conn::http1;
 use hyper1::server::conn::http2;
 use hyper1::service::service_fn;
 use hyper1::service::HttpService;
-
 use hyper1::StatusCode;
 use once_cell::sync::Lazy;
-use pin_project::pin_project;
-use pin_project::pinned_drop;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 type Request = hyper1::Request<Incoming>;
-type Response = hyper1::Response<ResponseBytes>;
 
 static USE_WRITEV: Lazy<bool> = Lazy::new(|| {
-  let disable_writev = std::env::var("DENO_HYPER_USE_WRITEV").ok();
+  let enable = std::env::var("DENO_USE_WRITEV").ok();
 
-  if let Some(val) = disable_writev {
-    return val != "0";
+  if let Some(val) = enable {
+    return !val.is_empty();
   }
 
-  true
+  false
 });
+
+pub const UNSTABLE_FEATURE_NAME: &str = "http";
 
 /// All HTTP/2 connections start with this byte string.
 ///
@@ -93,10 +99,10 @@ static USE_WRITEV: Lazy<bool> = Lazy::new(|| {
 /// MUST be followed by a SETTINGS frame (Section 6.5), which MAY be empty.
 const HTTP2_PREFIX: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-/// ALPN negotation for "h2"
+/// ALPN negotiation for "h2"
 const TLS_ALPN_HTTP_2: &[u8] = b"h2";
 
-/// ALPN negotation for "http/1.1"
+/// ALPN negotiation for "http/1.1"
 const TLS_ALPN_HTTP_11: &[u8] = b"http/1.1";
 
 /// Name a trait for streams we can serve HTTP over.
@@ -110,10 +116,11 @@ impl<
 {
 }
 
-#[op]
+#[op2(fast)]
+#[smi]
 pub fn op_http_upgrade_raw(
   state: &mut OpState,
-  slab_id: SlabId,
+  #[smi] slab_id: SlabId,
 ) -> Result<ResourceId, AnyError> {
   // Stage 1: extract the upgrade future
   let upgrade = slab_get(slab_id).upgrade()?;
@@ -133,7 +140,7 @@ pub fn op_http_upgrade_raw(
           let mut http = slab_get(slab_id);
           *http.response() = response;
           http.complete();
-          let mut upgraded = upgrade.await?;
+          let mut upgraded = TokioIo::new(upgrade.await?);
           upgraded.write_all(&bytes).await?;
           break upgraded;
         }
@@ -177,11 +184,12 @@ pub fn op_http_upgrade_raw(
   )
 }
 
-#[op]
+#[op2(async)]
+#[smi]
 pub async fn op_http_upgrade_websocket_next(
   state: Rc<RefCell<OpState>>,
-  slab_id: SlabId,
-  headers: Vec<(ByteString, ByteString)>,
+  #[smi] slab_id: SlabId,
+  #[serde] headers: Vec<(ByteString, ByteString)>,
 ) -> Result<ResourceId, AnyError> {
   let mut http = slab_get(slab_id);
   // Stage 1: set the response to 101 Switching Protocols and send it
@@ -205,18 +213,22 @@ pub async fn op_http_upgrade_websocket_next(
   ws_create_server_stream(&mut state.borrow_mut(), stream, bytes)
 }
 
-#[op(fast)]
-pub fn op_http_set_promise_complete(slab_id: SlabId, status: u16) {
+#[op2(fast)]
+pub fn op_http_set_promise_complete(#[smi] slab_id: SlabId, status: u16) {
   let mut http = slab_get(slab_id);
-  // The Javascript code will never provide a status that is invalid here (see 23_response.js)
-  *http.response().status_mut() = StatusCode::from_u16(status).unwrap();
+  // The Javascript code should never provide a status that is invalid here (see 23_response.js), so we
+  // will quitely ignore invalid values.
+  if let Ok(code) = StatusCode::from_u16(status) {
+    *http.response().status_mut() = code;
+  }
   http.complete();
 }
 
-#[op]
-pub fn op_http_get_request_method_and_url<HTTP>(
-  slab_id: SlabId,
-) -> (String, Option<String>, String, String, Option<u16>)
+#[op2]
+pub fn op_http_get_request_method_and_url<'scope, HTTP>(
+  scope: &mut v8::HandleScope<'scope>,
+  #[smi] slab_id: SlabId,
+) -> v8::Local<'scope, v8::Array>
 where
   HTTP: HttpPropertyExtractor,
 {
@@ -229,39 +241,75 @@ where
     &request_parts.headers,
   );
 
+  let method: v8::Local<v8::Value> = v8::String::new_from_utf8(
+    scope,
+    request_parts.method.as_str().as_bytes(),
+    v8::NewStringType::Normal,
+  )
+  .unwrap()
+  .into();
+
+  let authority: v8::Local<v8::Value> = match request_properties.authority {
+    Some(authority) => v8::String::new_from_utf8(
+      scope,
+      authority.as_ref(),
+      v8::NewStringType::Normal,
+    )
+    .unwrap()
+    .into(),
+    None => v8::undefined(scope).into(),
+  };
+
   // Only extract the path part - we handle authority elsewhere
   let path = match &request_parts.uri.path_and_query() {
     Some(path_and_query) => path_and_query.to_string(),
     None => "".to_owned(),
   };
 
-  // TODO(mmastrac): Passing method can be optimized
-  (
-    request_parts.method.as_str().to_owned(),
-    request_properties.authority,
-    path,
-    String::from(request_info.peer_address.as_ref()),
-    request_info.peer_port,
+  let path: v8::Local<v8::Value> =
+    v8::String::new_from_utf8(scope, path.as_ref(), v8::NewStringType::Normal)
+      .unwrap()
+      .into();
+
+  let peer_address: v8::Local<v8::Value> = v8::String::new_from_utf8(
+    scope,
+    request_info.peer_address.as_bytes(),
+    v8::NewStringType::Normal,
   )
+  .unwrap()
+  .into();
+
+  let port: v8::Local<v8::Value> = match request_info.peer_port {
+    Some(port) => v8::Integer::new(scope, port.into()).into(),
+    None => v8::undefined(scope).into(),
+  };
+
+  let vec = [method, authority, path, peer_address, port];
+  v8::Array::new_with_elements(scope, vec.as_slice())
 }
 
-#[op]
+#[op2]
+#[serde]
 pub fn op_http_get_request_header(
-  slab_id: SlabId,
-  name: String,
+  #[smi] slab_id: SlabId,
+  #[string] name: String,
 ) -> Option<ByteString> {
   let http = slab_get(slab_id);
   let value = http.request_parts().headers.get(name);
   value.map(|value| value.as_bytes().into())
 }
 
-#[op]
-pub fn op_http_get_request_headers(
-  slab_id: SlabId,
-) -> Vec<(ByteString, ByteString)> {
+#[op2]
+pub fn op_http_get_request_headers<'scope>(
+  scope: &mut v8::HandleScope<'scope>,
+  #[smi] slab_id: SlabId,
+) -> v8::Local<'scope, v8::Array> {
   let http = slab_get(slab_id);
   let headers = &http.request_parts().headers;
-  let mut vec = Vec::with_capacity(headers.len());
+  // Two slots for each header key/value pair
+  let mut vec: SmallVec<[v8::Local<v8::Value>; 32]> =
+    SmallVec::with_capacity(headers.len() * 2);
+
   let mut cookies: Option<Vec<&[u8]>> = None;
   for (name, value) in headers {
     if name == COOKIE {
@@ -271,8 +319,24 @@ pub fn op_http_get_request_headers(
         cookies = Some(vec![value.as_bytes()]);
       }
     } else {
-      let name: &[u8] = name.as_ref();
-      vec.push((name.into(), value.as_bytes().into()))
+      vec.push(
+        v8::String::new_from_one_byte(
+          scope,
+          name.as_ref(),
+          v8::NewStringType::Normal,
+        )
+        .unwrap()
+        .into(),
+      );
+      vec.push(
+        v8::String::new_from_one_byte(
+          scope,
+          value.as_bytes(),
+          v8::NewStringType::Normal,
+        )
+        .unwrap()
+        .into(),
+      );
     }
   }
 
@@ -283,69 +347,124 @@ pub fn op_http_get_request_headers(
   // TODO(mmastrac): This should probably happen on the JS side on-demand
   if let Some(cookies) = cookies {
     let cookie_sep = "; ".as_bytes();
-    vec.push((
-      ByteString::from(COOKIE.as_str()),
-      ByteString::from(cookies.join(cookie_sep)),
-    ));
+
+    vec.push(
+      v8::String::new_external_onebyte_static(scope, COOKIE.as_ref())
+        .unwrap()
+        .into(),
+    );
+    vec.push(
+      v8::String::new_from_one_byte(
+        scope,
+        cookies.join(cookie_sep).as_ref(),
+        v8::NewStringType::Normal,
+      )
+      .unwrap()
+      .into(),
+    );
   }
-  vec
+
+  v8::Array::new_with_elements(scope, vec.as_slice())
 }
 
-#[op(fast)]
+#[op2(fast)]
+#[smi]
 pub fn op_http_read_request_body(
-  state: &mut OpState,
-  slab_id: SlabId,
+  state: Rc<RefCell<OpState>>,
+  #[smi] slab_id: SlabId,
 ) -> ResourceId {
   let mut http = slab_get(slab_id);
-  let incoming = http.take_body();
-  let body_resource = Rc::new(HttpRequestBody::new(incoming));
-  state.resource_table.add_rc(body_resource)
+  let rid = if let Some(incoming) = http.take_body() {
+    let body_resource = Rc::new(HttpRequestBody::new(incoming));
+    state.borrow_mut().resource_table.add_rc(body_resource)
+  } else {
+    // This should not be possible, but rather than panicking we'll return an invalid
+    // resource value to JavaScript.
+    ResourceId::MAX
+  };
+  http.put_resource(HttpRequestBodyAutocloser::new(rid, state.clone()));
+  rid
 }
 
-#[op(fast)]
-pub fn op_http_set_response_header(slab_id: SlabId, name: &str, value: &str) {
+#[op2(fast)]
+pub fn op_http_set_response_header(
+  #[smi] slab_id: SlabId,
+  #[string(onebyte)] name: Cow<[u8]>,
+  #[string(onebyte)] value: Cow<[u8]>,
+) {
   let mut http = slab_get(slab_id);
   let resp_headers = http.response().headers_mut();
   // These are valid latin-1 strings
-  let name = HeaderName::from_bytes(name.as_bytes()).unwrap();
-  let value = HeaderValue::from_bytes(value.as_bytes()).unwrap();
+  let name = HeaderName::from_bytes(&name).unwrap();
+  let value = match value {
+    Cow::Borrowed(bytes) => HeaderValue::from_bytes(bytes).unwrap(),
+    // SAFETY: These are valid latin-1 strings
+    Cow::Owned(bytes_vec) => unsafe {
+      HeaderValue::from_maybe_shared_unchecked(bytes::Bytes::from(bytes_vec))
+    },
+  };
   resp_headers.append(name, value);
 }
 
-#[op]
+#[op2]
 pub fn op_http_set_response_headers(
-  slab_id: SlabId,
-  headers: Vec<(ByteString, ByteString)>,
+  scope: &mut v8::HandleScope,
+  #[smi] slab_id: SlabId,
+  headers: v8::Local<v8::Array>,
 ) {
   let mut http = slab_get(slab_id);
   // TODO(mmastrac): Invalid headers should be handled?
   let resp_headers = http.response().headers_mut();
-  resp_headers.reserve(headers.len());
-  for (name, value) in headers {
-    // These are valid latin-1 strings
-    let name = HeaderName::from_bytes(&name).unwrap();
-    let value = HeaderValue::from_bytes(&value).unwrap();
-    resp_headers.append(name, value);
+
+  let len = headers.length();
+  let header_len = len * 2;
+  resp_headers.reserve(header_len.try_into().unwrap());
+
+  for i in 0..len {
+    let item = headers.get_index(scope, i).unwrap();
+    let pair = v8::Local::<v8::Array>::try_from(item).unwrap();
+    let name = pair.get_index(scope, 0).unwrap();
+    let value = pair.get_index(scope, 1).unwrap();
+
+    let v8_name: ByteString = from_v8(scope, name).unwrap();
+    let v8_value: ByteString = from_v8(scope, value).unwrap();
+    let header_name = HeaderName::from_bytes(&v8_name).unwrap();
+    let header_value =
+      // SAFETY: These are valid latin-1 strings
+      unsafe { HeaderValue::from_maybe_shared_unchecked(v8_value) };
+    resp_headers.append(header_name, header_value);
   }
 }
 
-#[op]
+#[op2]
 pub fn op_http_set_response_trailers(
-  slab_id: SlabId,
-  trailers: Vec<(ByteString, ByteString)>,
+  #[smi] slab_id: SlabId,
+  #[serde] trailers: Vec<(ByteString, ByteString)>,
 ) {
   let mut http = slab_get(slab_id);
   let mut trailer_map: HeaderMap = HeaderMap::with_capacity(trailers.len());
   for (name, value) in trailers {
     // These are valid latin-1 strings
     let name = HeaderName::from_bytes(&name).unwrap();
-    let value = HeaderValue::from_bytes(&value).unwrap();
+    // SAFETY: These are valid latin-1 strings
+    let value = unsafe { HeaderValue::from_maybe_shared_unchecked(value) };
     trailer_map.append(name, value);
   }
   *http.trailers().borrow_mut() = Some(trailer_map);
 }
 
-fn is_request_compressible(headers: &HeaderMap) -> Compression {
+fn is_request_compressible(
+  length: Option<usize>,
+  headers: &HeaderMap,
+) -> Compression {
+  if let Some(length) = length {
+    // By the time we add compression headers and Accept-Encoding, it probably doesn't make sense
+    // to compress stuff that's smaller than this.
+    if length < 64 {
+      return Compression::None;
+    }
+  }
+
   let Some(accept_encoding) = headers.get(ACCEPT_ENCODING) else {
     return Compression::None;
   };
@@ -403,17 +522,9 @@ fn is_response_compressible(headers: &HeaderMap) -> bool {
 
 fn modify_compressibility_from_response(
   compression: Compression,
-  length: Option<usize>,
   headers: &mut HeaderMap,
 ) -> Compression {
   ensure_vary_accept_encoding(headers);
-  if let Some(length) = length {
-    // By the time we add compression headers and Accept-Encoding, it probably doesn't make sense
-    // to compress stuff that's smaller than this.
-    if length < 64 {
-      return Compression::None;
-    }
-  }
   if compression == Compression::None {
     return Compression::None;
   }
@@ -463,39 +574,70 @@ fn ensure_vary_accept_encoding(hmap: &mut HeaderMap) {
   );
 }
 
+/// Sets the appropriate response body. Use `force_instantiate_body` if you need
+/// to ensure that the response is cleaned up correctly (eg: for resources).
 fn set_response(
   slab_id: SlabId,
   length: Option<usize>,
+  status: u16,
+  force_instantiate_body: bool,
   response_fn: impl FnOnce(Compression) -> ResponseBytesInner,
 ) {
   let mut http = slab_get(slab_id);
-  let compression = is_request_compressible(&http.request_parts().headers);
-  let response = http.response();
-  let compression = modify_compressibility_from_response(
-    compression,
-    length,
-    response.headers_mut(),
-  );
-  response.body_mut().initialize(response_fn(compression))
+  // The request may have been cancelled by this point and if so, there's no need for us to
+  // do all of this work to send the response.
+  if !http.cancelled() {
+    let resource = http.take_resource();
+    let compression =
+      is_request_compressible(length, &http.request_parts().headers);
+    let response = http.response();
+    let compression =
+      modify_compressibility_from_response(compression, response.headers_mut());
+    response
+      .body_mut()
+      .initialize(response_fn(compression), resource);
+
+    // The Javascript code should never provide a status that is invalid here (see 23_response.js), so we
+    // will quitely ignore invalid values.
+    if let Ok(code) = StatusCode::from_u16(status) {
+      *response.status_mut() = code;
+    }
+  } else if force_instantiate_body {
+    response_fn(Compression::None).abort();
+  }
+
+  http.complete();
 }
 
-#[op(fast)]
+#[op2(fast)]
 pub fn op_http_set_response_body_resource(
-  state: &mut OpState,
-  slab_id: SlabId,
-  stream_rid: ResourceId,
+  state: Rc<RefCell<OpState>>,
+  #[smi] slab_id: SlabId,
+  #[smi] stream_rid: ResourceId,
   auto_close: bool,
+  status: u16,
 ) -> Result<(), AnyError> {
+  // IMPORTANT: We might end up requiring the OpState lock in set_response if we need to drop the request
+  // body resource so we _cannot_ hold the OpState lock longer than necessary.
+
   // If the stream is auto_close, we will hold the last ref to it until the response is complete.
-  let resource = if auto_close {
-    state.resource_table.take_any(stream_rid)?
-  } else {
-    state.resource_table.get_any(stream_rid)?
+  // TODO(mmastrac): We should be using the same auto-close functionality rather than removing autoclose resources.
+  // It's possible things could fail elsewhere if code expects the rid to continue existing after the response has been
+  // returned.
+  let resource = {
+    let mut state = state.borrow_mut();
+    if auto_close {
+      state.resource_table.take_any(stream_rid)?
+    } else {
+      state.resource_table.get_any(stream_rid)?
+    }
   };
 
   set_response(
     slab_id,
     resource.size_hint().1.map(|s| s as usize),
+    status,
+    true,
     move |compression| {
       ResponseBytesInner::from_resource(compression, resource, auto_close)
     },
@@ -504,43 +646,42 @@ pub fn op_http_set_response_body_resource(
   Ok(())
 }
 
-#[op(fast)]
-pub fn op_http_set_response_body_stream(
-  state: &mut OpState,
-  slab_id: SlabId,
-) -> Result<ResourceId, AnyError> {
-  // TODO(mmastrac): what should this channel size be?
-  let (tx, rx) = tokio::sync::mpsc::channel(1);
-  set_response(slab_id, None, |compression| {
-    ResponseBytesInner::from_v8(compression, rx)
-  });
-
-  Ok(state.resource_table.add(V8StreamHttpResponseBody::new(tx)))
-}
-
-#[op(fast)]
-pub fn op_http_set_response_body_text(slab_id: SlabId, text: String) {
+#[op2(fast)]
+pub fn op_http_set_response_body_text(
+  #[smi] slab_id: SlabId,
+  #[string] text: String,
+  status: u16,
+) {
   if !text.is_empty() {
-    set_response(slab_id, Some(text.len()), |compression| {
+    set_response(slab_id, Some(text.len()), status, false, |compression| {
       ResponseBytesInner::from_vec(compression, text.into_bytes())
     });
+  } else {
+    op_http_set_promise_complete::call(slab_id, status);
   }
 }
 
-#[op(fast)]
-pub fn op_http_set_response_body_bytes(slab_id: SlabId, buffer: &[u8]) {
+// Skipping `fast` because we prefer an owned buffer here.
+#[op2]
+pub fn op_http_set_response_body_bytes(
+  #[smi] slab_id: SlabId,
+  #[buffer] buffer: JsBuffer,
+  status: u16,
+) {
   if !buffer.is_empty() {
-    set_response(slab_id, Some(buffer.len()), |compression| {
-      ResponseBytesInner::from_slice(compression, buffer)
+    set_response(slab_id, Some(buffer.len()), status, false, |compression| {
+      ResponseBytesInner::from_bufview(compression, BufView::from(buffer))
     });
-  };
+  } else {
+    op_http_set_promise_complete::call(slab_id, status);
+  }
 }
 
-#[op]
+#[op2(async)]
 pub async fn op_http_track(
   state: Rc<RefCell<OpState>>,
-  slab_id: SlabId,
-  server_rid: ResourceId,
+  #[smi] slab_id: SlabId,
+  #[smi] server_rid: ResourceId,
 ) -> Result<(), AnyError> {
   let http = slab_get(slab_id);
   let handle = http.body_promise();
@@ -550,7 +691,10 @@ pub async fn op_http_track(
     .resource_table
     .get::<HttpJoinHandle>(server_rid)?;
 
-  match handle.or_cancel(join_handle.cancel_handle()).await {
+  match handle
+    .or_cancel(join_handle.connection_cancel_handle())
+    .await
+  {
     Ok(true) => Ok(()),
     Ok(false) => {
       Err(AnyError::msg("connection closed before message completed"))
@@ -559,90 +703,78 @@ pub async fn op_http_track(
   }
 }
 
-#[pin_project(PinnedDrop)]
-pub struct SlabFuture<F: Future<Output = ()>>(SlabId, #[pin] F);
-
-pub fn new_slab_future(
-  request: Request,
-  request_info: HttpConnectionProperties,
-  tx: tokio::sync::mpsc::Sender<SlabId>,
-) -> SlabFuture<impl Future<Output = ()>> {
-  let index = slab_insert(request, request_info);
-  let rx = slab_get(index).promise();
-  SlabFuture(index, async move {
-    if tx.send(index).await.is_ok() {
-      // We only need to wait for completion if we aren't closed
-      rx.await;
-    }
-  })
-}
-
-impl<F: Future<Output = ()>> SlabFuture<F> {}
-
-#[pinned_drop]
-impl<F: Future<Output = ()>> PinnedDrop for SlabFuture<F> {
-  fn drop(self: Pin<&mut Self>) {
-    slab_drop(self.0);
-  }
-}
-
-impl<F: Future<Output = ()>> Future for SlabFuture<F> {
-  type Output = Result<Response, hyper::Error>;
-
-  fn poll(
-    self: Pin<&mut Self>,
-    cx: &mut std::task::Context<'_>,
-  ) -> std::task::Poll<Self::Output> {
-    let index = self.0;
-    self
-      .project()
-      .1
-      .poll(cx)
-      .map(|_| Ok(slab_get(index).take_response()))
-  }
-}
-
 fn serve_http11_unconditional(
   io: impl HttpServeStream,
   svc: impl HttpService<Incoming, ResBody = ResponseBytes> + 'static,
-) -> impl Future<Output = Result<(), AnyError>> + 'static {
+  cancel: Rc<CancelHandle>,
+) -> impl Future<Output = Result<(), hyper1::Error>> + 'static {
   let conn = http1::Builder::new()
     .keep_alive(true)
     .writev(*USE_WRITEV)
-    .serve_connection(io, svc);
+    .serve_connection(TokioIo::new(io), svc)
+    .with_upgrades();
 
-  conn.with_upgrades().map_err(AnyError::from)
+  async {
+    match conn.or_abort(cancel).await {
+      Err(mut conn) => {
+        Pin::new(&mut conn).graceful_shutdown();
+        conn.await
+      }
+      Ok(res) => res,
+    }
+  }
 }
 
 fn serve_http2_unconditional(
   io: impl HttpServeStream,
   svc: impl HttpService<Incoming, ResBody = ResponseBytes> + 'static,
-) -> impl Future<Output = Result<(), AnyError>> + 'static {
-  let conn = http2::Builder::new(LocalExecutor).serve_connection(io, svc);
-  conn.map_err(AnyError::from)
+  cancel: Rc<CancelHandle>,
+) -> impl Future<Output = Result<(), hyper1::Error>> + 'static {
+  let conn =
+    http2::Builder::new(LocalExecutor).serve_connection(TokioIo::new(io), svc);
+  async {
+    match conn.or_abort(cancel).await {
+      Err(mut conn) => {
+        Pin::new(&mut conn).graceful_shutdown();
+        conn.await
+      }
+      Ok(res) => res,
+    }
+  }
 }
 
 async fn serve_http2_autodetect(
   io: impl HttpServeStream,
   svc: impl HttpService<Incoming, ResBody = ResponseBytes> + 'static,
+  cancel: Rc<CancelHandle>,
 ) -> Result<(), AnyError> {
   let prefix = NetworkStreamPrefixCheck::new(io, HTTP2_PREFIX);
   let (matches, io) = prefix.match_prefix().await?;
   if matches {
-    serve_http2_unconditional(io, svc).await
+    serve_http2_unconditional(io, svc, cancel)
+      .await
+      .map_err(|e| e.into())
   } else {
-    serve_http11_unconditional(io, svc).await
+    serve_http11_unconditional(io, svc, cancel)
+      .await
+      .map_err(|e| e.into())
   }
 }
 
 fn serve_https(
   mut io: TlsStream,
   request_info: HttpConnectionProperties,
-  cancel: Rc<CancelHandle>,
+  lifetime: HttpLifetime,
   tx: tokio::sync::mpsc::Sender<SlabId>,
 ) -> JoinHandle<Result<(), AnyError>> {
+  let HttpLifetime {
+    refcount,
+    connection_cancel_handle,
+    listen_cancel_handle,
+  } = lifetime;
+
   let svc = service_fn(move |req: Request| {
-    new_slab_future(req, request_info.clone(), tx.clone())
+    new_slab_future(req, request_info.clone(), refcount.clone(), tx.clone())
   });
   spawn(
     async {
@@ -651,33 +783,46 @@ fn serve_https(
       // based on the prefix bytes
       let handshake = io.get_ref().1.alpn_protocol();
       if handshake == Some(TLS_ALPN_HTTP_2) {
-        serve_http2_unconditional(io, svc).await
+        serve_http2_unconditional(io, svc, listen_cancel_handle)
+          .await
+          .map_err(|e| e.into())
       } else if handshake == Some(TLS_ALPN_HTTP_11) {
-        serve_http11_unconditional(io, svc).await
+        serve_http11_unconditional(io, svc, listen_cancel_handle)
+          .await
+          .map_err(|e| e.into())
       } else {
-        serve_http2_autodetect(io, svc).await
+        serve_http2_autodetect(io, svc, listen_cancel_handle).await
       }
     }
-    .try_or_cancel(cancel),
+    .try_or_cancel(connection_cancel_handle),
   )
 }
 
 fn serve_http(
   io: impl HttpServeStream,
   request_info: HttpConnectionProperties,
-  cancel: Rc<CancelHandle>,
+  lifetime: HttpLifetime,
   tx: tokio::sync::mpsc::Sender<SlabId>,
 ) -> JoinHandle<Result<(), AnyError>> {
+  let HttpLifetime {
+    refcount,
+    connection_cancel_handle,
+    listen_cancel_handle,
+  } = lifetime;
+
   let svc = service_fn(move |req: Request| {
-    new_slab_future(req, request_info.clone(), tx.clone())
+    new_slab_future(req, request_info.clone(), refcount.clone(), tx.clone())
   });
-  spawn(serve_http2_autodetect(io, svc).try_or_cancel(cancel))
+  spawn(
+    serve_http2_autodetect(io, svc, listen_cancel_handle)
+      .try_or_cancel(connection_cancel_handle),
+  )
 }
 
 fn serve_http_on<HTTP>(
   connection: HTTP::Connection,
   listen_properties: &HttpListenProperties,
-  cancel: Rc<CancelHandle>,
+  lifetime: HttpLifetime,
   tx: tokio::sync::mpsc::Sender<SlabId>,
 ) -> JoinHandle<Result<(), AnyError>>
 where
@@ -690,28 +835,58 @@ where
 
   match network_stream {
     NetworkStream::Tcp(conn) => {
-      serve_http(conn, connection_properties, cancel, tx)
+      serve_http(conn, connection_properties, lifetime, tx)
     }
     NetworkStream::Tls(conn) => {
-      serve_https(conn, connection_properties, cancel, tx)
+      serve_https(conn, connection_properties, lifetime, tx)
     }
     #[cfg(unix)]
     NetworkStream::Unix(conn) => {
-      serve_http(conn, connection_properties, cancel, tx)
+      serve_http(conn, connection_properties, lifetime, tx)
     }
   }
 }
 
-struct HttpJoinHandle(
-  AsyncRefCell<Option<JoinHandle<Result<(), AnyError>>>>,
-  // Cancel handle must live in a separate Rc to avoid keeping the outer join handle ref'd
-  Rc<CancelHandle>,
-  AsyncRefCell<tokio::sync::mpsc::Receiver<SlabId>>,
-);
+#[derive(Clone)]
+struct HttpLifetime {
+  connection_cancel_handle: Rc<CancelHandle>,
+  listen_cancel_handle: Rc<CancelHandle>,
+  refcount: RefCount,
+}
+
+struct HttpJoinHandle {
+  join_handle: AsyncRefCell<Option<JoinHandle<Result<(), AnyError>>>>,
+  connection_cancel_handle: Rc<CancelHandle>,
+  listen_cancel_handle: Rc<CancelHandle>,
+  rx: AsyncRefCell<tokio::sync::mpsc::Receiver<SlabId>>,
+  refcount: RefCount,
+}
 
 impl HttpJoinHandle {
-  fn cancel_handle(self: &Rc<Self>) -> Rc<CancelHandle> {
-    self.1.clone()
+  fn new(rx: tokio::sync::mpsc::Receiver<SlabId>) -> Self {
+    Self {
+      join_handle: AsyncRefCell::new(None),
+      connection_cancel_handle: CancelHandle::new_rc(),
+      listen_cancel_handle: CancelHandle::new_rc(),
+      rx: AsyncRefCell::new(rx),
+      refcount: RefCount::default(),
+    }
+  }
+
+  fn lifetime(self: &Rc<Self>) -> HttpLifetime {
+    HttpLifetime {
+      connection_cancel_handle: self.connection_cancel_handle.clone(),
+      listen_cancel_handle: self.listen_cancel_handle.clone(),
+      refcount: self.refcount.clone(),
+    }
+  }
+
+  fn connection_cancel_handle(self: &Rc<Self>) -> Rc<CancelHandle> {
+    self.connection_cancel_handle.clone()
+  }
+
+  fn listen_cancel_handle(self: &Rc<Self>) -> Rc<CancelHandle> {
+    self.listen_cancel_handle.clone()
   }
 }
 
@@ -721,48 +896,52 @@ impl Resource for HttpJoinHandle {
   }
 
   fn close(self: Rc<Self>) {
-    self.1.cancel()
+    // During a close operation, we cancel everything
+    self.connection_cancel_handle.cancel();
+    self.listen_cancel_handle.cancel();
   }
 }
 
 impl Drop for HttpJoinHandle {
   fn drop(&mut self) {
     // In some cases we may be dropped without closing, so let's cancel everything on the way out
-    self.1.cancel();
+    self.connection_cancel_handle.cancel();
+    self.listen_cancel_handle.cancel();
   }
 }
 
-#[op(v8)]
+#[op2]
+#[serde]
 pub fn op_http_serve<HTTP>(
   state: Rc<RefCell<OpState>>,
-  listener_rid: ResourceId,
+  #[smi] listener_rid: ResourceId,
 ) -> Result<(ResourceId, &'static str, String), AnyError>
 where
   HTTP: HttpPropertyExtractor,
 {
+  slab_init();
+
   let listener =
     HTTP::get_listener_for_rid(&mut state.borrow_mut(), listener_rid)?;
 
   let listen_properties = HTTP::listen_properties_from_listener(&listener)?;
 
   let (tx, rx) = tokio::sync::mpsc::channel(10);
-  let resource: Rc<HttpJoinHandle> = Rc::new(HttpJoinHandle(
-    AsyncRefCell::new(None),
-    CancelHandle::new_rc(),
-    AsyncRefCell::new(rx),
-  ));
-  let cancel_clone = resource.cancel_handle();
+  let resource: Rc<HttpJoinHandle> = Rc::new(HttpJoinHandle::new(rx));
+  let listen_cancel_clone = resource.listen_cancel_handle();
+
+  let lifetime = resource.lifetime();
 
   let listen_properties_clone: HttpListenProperties = listen_properties.clone();
   let handle = spawn(async move {
     loop {
       let conn = HTTP::accept_connection_from_listener(&listener)
-        .try_or_cancel(cancel_clone.clone())
+        .try_or_cancel(listen_cancel_clone.clone())
         .await?;
       serve_http_on::<HTTP>(
         conn,
         &listen_properties_clone,
-        cancel_clone.clone(),
+        lifetime.clone(),
         tx.clone(),
       );
     }
@@ -771,7 +950,7 @@ where
   });
 
   // Set the handle after we start the future
-  *RcRef::map(&resource, |this| &this.0)
+  *RcRef::map(&resource, |this| &this.join_handle)
     .try_borrow_mut()
     .unwrap() = Some(handle);
 
@@ -782,36 +961,35 @@ where
   ))
 }
 
-#[op(v8)]
+#[op2]
+#[serde]
 pub fn op_http_serve_on<HTTP>(
   state: Rc<RefCell<OpState>>,
-  connection_rid: ResourceId,
+  #[smi] connection_rid: ResourceId,
 ) -> Result<(ResourceId, &'static str, String), AnyError>
 where
   HTTP: HttpPropertyExtractor,
 {
+  slab_init();
+
   let connection =
     HTTP::get_connection_for_rid(&mut state.borrow_mut(), connection_rid)?;
 
   let listen_properties = HTTP::listen_properties_from_connection(&connection)?;
 
   let (tx, rx) = tokio::sync::mpsc::channel(10);
-  let resource: Rc<HttpJoinHandle> = Rc::new(HttpJoinHandle(
-    AsyncRefCell::new(None),
-    CancelHandle::new_rc(),
-    AsyncRefCell::new(rx),
-  ));
+  let resource: Rc<HttpJoinHandle> = Rc::new(HttpJoinHandle::new(rx));
 
   let handle: JoinHandle<Result<(), deno_core::anyhow::Error>> =
     serve_http_on::<HTTP>(
       connection,
       &listen_properties,
-      resource.cancel_handle(),
+      resource.lifetime(),
       tx,
     );
 
   // Set the handle after we start the future
-  *RcRef::map(&resource, |this| &this.0)
+  *RcRef::map(&resource, |this| &this.join_handle)
     .try_borrow_mut()
     .unwrap() = Some(handle);
 
@@ -824,17 +1002,18 @@ where
 
 /// Synchronous, non-blocking call to see if there are any further HTTP requests. If anything
 /// goes wrong in this method we return [`SlabId::MAX`] and let the async handler pick up the real error.
-#[op(fast)]
-pub fn op_http_try_wait(state: &mut OpState, rid: ResourceId) -> SlabId {
+#[op2(fast)]
+#[smi]
+pub fn op_http_try_wait(state: &mut OpState, #[smi] rid: ResourceId) -> SlabId {
   // The resource needs to exist.
-  let Ok(join_handle) = state
-    .resource_table
-    .get::<HttpJoinHandle>(rid) else {
-      return SlabId::MAX;
+  let Ok(join_handle) = state.resource_table.get::<HttpJoinHandle>(rid) else {
+    return SlabId::MAX;
   };
 
   // If join handle is somehow locked, just abort.
-  let Some(mut handle) = RcRef::map(&join_handle, |this| &this.2).try_borrow_mut() else {
+  let Some(mut handle) =
+    RcRef::map(&join_handle, |this| &this.rx).try_borrow_mut()
+  else {
     return SlabId::MAX;
   };
 
@@ -846,10 +1025,11 @@ pub fn op_http_try_wait(state: &mut OpState, rid: ResourceId) -> SlabId {
   id
 }
 
-#[op]
+#[op2(async)]
+#[smi]
 pub async fn op_http_wait(
   state: Rc<RefCell<OpState>>,
-  rid: ResourceId,
+  #[smi] rid: ResourceId,
 ) -> Result<SlabId, AnyError> {
   // We will get the join handle initially, as we might be consuming requests still
   let join_handle = state
@@ -857,9 +1037,9 @@ pub async fn op_http_wait(
     .resource_table
     .get::<HttpJoinHandle>(rid)?;
 
-  let cancel = join_handle.cancel_handle();
+  let cancel = join_handle.listen_cancel_handle();
   let next = async {
-    let mut recv = RcRef::map(&join_handle, |this| &this.2).borrow_mut().await;
+    let mut recv = RcRef::map(&join_handle, |this| &this.rx).borrow_mut().await;
     recv.recv().await
   }
   .or_cancel(cancel)
@@ -872,18 +1052,12 @@ pub async fn op_http_wait(
   }
 
   // No - we're shutting down
-  let res = RcRef::map(join_handle, |this| &this.0)
+  let res = RcRef::map(join_handle, |this| &this.join_handle)
     .borrow_mut()
     .await
     .take()
     .unwrap()
     .await?;
-
-  // Drop the cancel and join handles
-  state
-    .borrow_mut()
-    .resource_table
-    .take::<HttpJoinHandle>(rid)?;
 
   // Filter out shutdown (ENOTCONN) errors
   if let Err(err) = res {
@@ -898,6 +1072,72 @@ pub async fn op_http_wait(
   }
 
   Ok(SlabId::MAX)
+}
+
+/// Cancels the HTTP handle.
+#[op2(fast)]
+pub fn op_http_cancel(
+  state: &mut OpState,
+  #[smi] rid: ResourceId,
+  graceful: bool,
+) -> Result<(), AnyError> {
+  let join_handle = state.resource_table.get::<HttpJoinHandle>(rid)?;
+
+  if graceful {
+    // In a graceful shutdown, we close the listener and allow all the remaining connections to drain
+    join_handle.listen_cancel_handle().cancel();
+  } else {
+    // In a forceful shutdown, we close everything
+    join_handle.listen_cancel_handle().cancel();
+    join_handle.connection_cancel_handle().cancel();
+  }
+
+  Ok(())
+}
+
+#[op2(async)]
+pub async fn op_http_close(
+  state: Rc<RefCell<OpState>>,
+  #[smi] rid: ResourceId,
+  graceful: bool,
+) -> Result<(), AnyError> {
+  let join_handle = state
+    .borrow_mut()
+    .resource_table
+    .take::<HttpJoinHandle>(rid)?;
+
+  if graceful {
+    // TODO(bartlomieju): replace with `state.feature_checker.check_or_exit`
+    // once we phase out `check_or_exit_with_legacy_fallback`
+    state
+      .borrow()
+      .feature_checker
+      .check_or_exit_with_legacy_fallback(
+        UNSTABLE_FEATURE_NAME,
+        "Deno.Server.shutdown",
+      );
+
+    // In a graceful shutdown, we close the listener and allow all the remaining connections to drain
+    join_handle.listen_cancel_handle().cancel();
+  } else {
+    // In a forceful shutdown, we close everything
+    join_handle.listen_cancel_handle().cancel();
+    join_handle.connection_cancel_handle().cancel();
+  }
+
+  // Async spin on the refcount while we wait for everything to drain
+  while Rc::strong_count(&join_handle.refcount.0) > 1 {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+
+  let mut join_handle = RcRef::map(&join_handle, |this| &this.join_handle)
+    .borrow_mut()
+    .await;
+  if let Some(join_handle) = join_handle.take() {
+    join_handle.await??;
+  }
+
+  Ok(())
 }
 
 struct UpgradeStream {
@@ -939,6 +1179,34 @@ impl UpgradeStream {
     .try_or_cancel(cancel_handle)
     .await
   }
+
+  async fn write_vectored(
+    self: Rc<Self>,
+    buf1: &[u8],
+    buf2: &[u8],
+  ) -> Result<usize, AnyError> {
+    let mut wr = RcRef::map(self, |r| &r.write).borrow_mut().await;
+
+    let total = buf1.len() + buf2.len();
+    let mut bufs = [std::io::IoSlice::new(buf1), std::io::IoSlice::new(buf2)];
+    let mut nwritten = wr.write_vectored(&bufs).await?;
+    if nwritten == total {
+      return Ok(nwritten);
+    }
+
+    // Slightly more optimized than (unstable) write_all_vectored for 2 iovecs.
+    while nwritten <= buf1.len() {
+      bufs[0] = std::io::IoSlice::new(&buf1[nwritten..]);
+      nwritten += wr.write_vectored(&bufs).await?;
+    }
+
+    // First buffer out of the way.
+    if nwritten < total && nwritten > buf1.len() {
+      wr.write_all(&buf2[nwritten - buf1.len()..]).await?;
+    }
+
+    Ok(total)
+  }
 }
 
 impl Resource for UpgradeStream {
@@ -952,4 +1220,26 @@ impl Resource for UpgradeStream {
   fn close(self: Rc<Self>) {
     self.cancel_handle.cancel();
   }
+}
+
+#[op2(fast)]
+pub fn op_can_write_vectored(
+  state: &mut OpState,
+  #[smi] rid: ResourceId,
+) -> bool {
+  state.resource_table.get::<UpgradeStream>(rid).is_ok()
+}
+
+#[op2(async)]
+#[number]
+pub async fn op_raw_write_vectored(
+  state: Rc<RefCell<OpState>>,
+  #[smi] rid: ResourceId,
+  #[buffer] buf1: JsBuffer,
+  #[buffer] buf2: JsBuffer,
+) -> Result<usize, AnyError> {
+  let resource: Rc<UpgradeStream> =
+    state.borrow().resource_table.get::<UpgradeStream>(rid)?;
+  let nwritten = resource.write_vectored(&buf1, &buf2).await?;
+  Ok(nwritten)
 }

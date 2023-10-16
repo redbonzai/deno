@@ -1,7 +1,6 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 use std::fs::File;
-use std::path::Path;
 use std::process::Command;
 use test_util as util;
 use test_util::TempDir;
@@ -30,35 +29,22 @@ fn compile_basic() {
       .run();
     output.assert_exit_code(0);
     output.skip_output_check();
-    let output = context
-      .new_command()
-      .command_name(exe.to_string_lossy())
-      .run();
+    let output = context.new_command().command_name(&exe).run();
     output.assert_matches_text("Welcome to Deno!\n");
   }
 
   // now ensure this works when the deno_dir is readonly
   let readonly_dir = dir.path().join("readonly");
-  make_dir_readonly(&readonly_dir);
+  readonly_dir.make_dir_readonly();
   let readonly_sub_dir = readonly_dir.join("sub");
 
   let output = context
     .new_command()
     // it should fail creating this, but still work
-    .env("DENO_DIR", readonly_sub_dir.to_string_lossy())
-    .command_name(exe.to_string_lossy())
+    .env("DENO_DIR", readonly_sub_dir)
+    .command_name(exe)
     .run();
   output.assert_matches_text("Welcome to Deno!\n");
-}
-
-fn make_dir_readonly(dir: &Path) {
-  std::fs::create_dir_all(dir).unwrap();
-  eprintln!("DIR: {}", dir.display());
-  if cfg!(windows) {
-    Command::new("attrib").arg("+r").arg(dir).output().unwrap();
-  } else if cfg!(unix) {
-    Command::new("chmod").arg("555").arg(dir).output().unwrap();
-  }
 }
 
 #[test]
@@ -134,9 +120,9 @@ fn standalone_error() {
   assert_contains!(stderr, "error: Uncaught Error: boom!");
   assert_contains!(stderr, "throw new Error(\"boom!\");");
   assert_contains!(stderr, "\n    at boom (file://");
-  assert_contains!(stderr, "standalone_error.ts:2:11");
+  assert_contains!(stderr, "standalone_error.ts:2:9");
   assert_contains!(stderr, "at foo (file://");
-  assert_contains!(stderr, "standalone_error.ts:5:5");
+  assert_contains!(stderr, "standalone_error.ts:5:3");
   assert_contains!(stderr, "standalone_error.ts:7:1");
 }
 
@@ -272,7 +258,7 @@ fn compile_with_file_exists_error() {
       "is an existing file. You can use the `--output <file-path>` flag to ",
       "provide an alternative name.\n",
     ),
-    file_path.display(),
+    file_path,
   );
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert_contains!(stderr, &expected_stderr);
@@ -305,7 +291,7 @@ fn compile_with_directory_exists_error() {
       "the same name. You can use the `--output <file-path>` flag to ",
       "provide an alternative name."
     ),
-    exe.display()
+    exe
   );
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert_contains!(stderr, &expected_stderr);
@@ -338,7 +324,7 @@ fn compile_with_conflict_file_exists_error() {
       "and cannot be overwritten. Please delete the existing file or ",
       "use the `--output <file-path>` flag to provide an alternative name."
     ),
-    exe.display()
+    exe
   );
   let stderr = String::from_utf8(output.stderr).unwrap();
   assert_contains!(stderr, &expected_stderr);
@@ -704,7 +690,7 @@ fn workers_not_in_module_map() {
 
   let output = context
     .new_command()
-    .command_name(exe.to_string_lossy())
+    .command_name(exe)
     .env("NO_COLOR", "")
     .run();
   output.assert_exit_code(1);
@@ -806,10 +792,7 @@ fn dynamic_import_unanalyzable() {
 
 #[test]
 fn compile_npm_specifiers() {
-  let context = TestContextBuilder::for_npm()
-    .use_sync_npm_download()
-    .use_temp_cwd()
-    .build();
+  let context = TestContextBuilder::for_npm().use_temp_cwd().build();
 
   let temp_dir = context.temp_dir();
   temp_dir.write(
@@ -842,10 +825,7 @@ fn compile_npm_specifiers() {
     output.assert_exit_code(0);
     output.skip_output_check();
 
-    let output = context
-      .new_command()
-      .command_name(binary_path.to_string_lossy())
-      .run();
+    let output = context.new_command().command_name(&binary_path).run();
     output.assert_matches_text(
       r#"Node esm importing node cjs
 ===========================
@@ -901,10 +881,7 @@ testing[WILDCARD]this
   output.assert_exit_code(0);
   output.skip_output_check();
 
-  let output = context
-    .new_command()
-    .command_name(binary_path.to_string_lossy())
-    .run();
+  let output = context.new_command().command_name(binary_path).run();
   output.assert_matches_text("2\n");
 }
 
@@ -1032,20 +1009,14 @@ struct RunNpmBinCompileOptions<'a> {
 }
 
 fn run_npm_bin_compile_test(opts: RunNpmBinCompileOptions) {
-  let context = TestContextBuilder::for_npm()
-    .use_sync_npm_download()
-    .use_temp_cwd()
-    .build();
+  let context = TestContextBuilder::for_npm().use_temp_cwd().build();
 
   let temp_dir = context.temp_dir();
   let testdata_path = context.testdata_path();
   let main_specifier = if opts.input_specifier.starts_with("npm:") {
     opts.input_specifier.to_string()
   } else {
-    testdata_path
-      .join(opts.input_specifier)
-      .to_string_lossy()
-      .to_string()
+    testdata_path.join(opts.input_specifier).to_string()
   };
 
   let mut args = vec!["compile".to_string()];
@@ -1068,6 +1039,9 @@ fn run_npm_bin_compile_test(opts: RunNpmBinCompileOptions) {
   output.assert_exit_code(0);
   output.skip_output_check();
 
+  // delete the npm folder in the DENO_DIR to ensure it's not using it
+  context.deno_dir().remove_dir_all("./npm");
+
   // run
   let binary_path = if cfg!(windows) {
     temp_dir.path().join(format!("{}.exe", opts.expected_name))
@@ -1076,7 +1050,7 @@ fn run_npm_bin_compile_test(opts: RunNpmBinCompileOptions) {
   };
   let output = context
     .new_command()
-    .command_name(binary_path.to_string_lossy())
+    .command_name(binary_path)
     .args_vec(opts.run_args)
     .run();
   output.assert_matches_file(opts.output_file);
@@ -1086,7 +1060,6 @@ fn run_npm_bin_compile_test(opts: RunNpmBinCompileOptions) {
 #[test]
 fn compile_node_modules_symlink_outside() {
   let context = TestContextBuilder::for_npm()
-    .use_sync_npm_download()
     .use_copy_temp_dir("compile/node_modules_symlink_outside")
     .cwd("compile/node_modules_symlink_outside")
     .build();
@@ -1141,9 +1114,6 @@ fn compile_node_modules_symlink_outside() {
   // run
   let binary_path =
     project_dir.join(if cfg!(windows) { "bin.exe" } else { "bin" });
-  let output = context
-    .new_command()
-    .command_name(binary_path.to_string_lossy())
-    .run();
+  let output = context.new_command().command_name(binary_path).run();
   output.assert_matches_file("compile/node_modules_symlink_outside/main.out");
 }

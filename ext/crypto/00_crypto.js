@@ -361,7 +361,7 @@ class CryptoKey {
   }
 }
 
-webidl.configurePrototype(CryptoKey);
+webidl.configureInterface(CryptoKey);
 const CryptoKeyPrototype = CryptoKey.prototype;
 
 /**
@@ -1211,7 +1211,7 @@ class SubtleCrypto {
     const length = getKeyLength(normalizedDerivedKeyAlgorithmLength);
 
     // 14.
-    const secret = await this.deriveBits(
+    const secret = await deriveBits(
       normalizedAlgorithm,
       baseKey,
       length,
@@ -2273,18 +2273,13 @@ function importKeyEd25519(
       }
 
       // 5.
-      if (jwk.alg !== undefined && jwk.alg !== "EdDSA") {
-        throw new DOMException("Invalid algorithm", "DataError");
-      }
-
-      // 6.
       if (
         keyUsages.length > 0 && jwk.use !== undefined && jwk.use !== "sig"
       ) {
         throw new DOMException("Invalid key usage", "DataError");
       }
 
-      // 7.
+      // 6.
       if (jwk.key_ops !== undefined) {
         if (
           ArrayPrototypeFind(
@@ -2311,15 +2306,20 @@ function importKeyEd25519(
         }
       }
 
-      // 8.
+      // 7.
       if (jwk.ext !== undefined && jwk.ext === false && extractable) {
         throw new DOMException("Invalid key extractability", "DataError");
       }
 
-      // 9.
+      // 8.
       if (jwk.d !== undefined) {
         // https://www.rfc-editor.org/rfc/rfc8037#section-2
-        const privateKeyData = ops.op_crypto_base64url_decode(jwk.d);
+        let privateKeyData;
+        try {
+          privateKeyData = ops.op_crypto_base64url_decode(jwk.d);
+        } catch (_) {
+          throw new DOMException("invalid private key data", "DataError");
+        }
 
         const handle = {};
         WeakMapPrototypeSet(KEY_STORE, handle, privateKeyData);
@@ -2337,7 +2337,12 @@ function importKeyEd25519(
         );
       } else {
         // https://www.rfc-editor.org/rfc/rfc8037#section-2
-        const publicKeyData = ops.op_crypto_base64url_decode(jwk.x);
+        let publicKeyData;
+        try {
+          publicKeyData = ops.op_crypto_base64url_decode(jwk.x);
+        } catch (_) {
+          throw new DOMException("invalid public key data", "DataError");
+        }
 
         const handle = {};
         WeakMapPrototypeSet(KEY_STORE, handle, publicKeyData);
@@ -2656,7 +2661,7 @@ function importKeyAES(
           TypedArrayPrototypeGetByteLength(keyData) * 8,
         )
       ) {
-        throw new DOMException("Invalid key length", "Datarror");
+        throw new DOMException("Invalid key length", "DataError");
       }
 
       break;
@@ -4079,7 +4084,6 @@ function exportKeyEd25519(format, key, innerKey) {
         : ops.op_crypto_base64url_encode(innerKey);
       const jwk = {
         kty: "OKP",
-        alg: "EdDSA",
         crv: "Ed25519",
         x,
         "key_ops": key.usages,
@@ -4407,7 +4411,7 @@ async function deriveBits(normalizedAlgorithm, baseKey, length) {
           publicKey: publicKeyData,
           algorithm: "ECDH",
           namedCurve: publicKey[_algorithm].namedCurve,
-          length,
+          length: length ?? 0,
         });
 
         // 8.
@@ -4667,7 +4671,7 @@ async function encrypt(normalizedAlgorithm, key, data) {
   }
 }
 
-webidl.configurePrototype(SubtleCrypto);
+webidl.configureInterface(SubtleCrypto);
 const subtle = webidl.createBranded(SubtleCrypto);
 
 class Crypto {
@@ -4730,7 +4734,7 @@ class Crypto {
   }
 }
 
-webidl.configurePrototype(Crypto);
+webidl.configureInterface(Crypto);
 const CryptoPrototype = Crypto.prototype;
 
 const crypto = webidl.createBranded(Crypto);

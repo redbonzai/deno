@@ -36,9 +36,7 @@ const {
   Number,
   NumberIsFinite,
   NumberIsNaN,
-  // deno-lint-ignore camelcase
   NumberMAX_SAFE_INTEGER,
-  // deno-lint-ignore camelcase
   NumberMIN_SAFE_INTEGER,
   ObjectAssign,
   ObjectCreate,
@@ -121,7 +119,7 @@ function type(V) {
     case "function":
     // Falls through
     default:
-      // Per ES spec, typeof returns an implemention-defined value that is not any of the existing ones for
+      // Per ES spec, typeof returns an implementation-defined value that is not any of the existing ones for
       // uncallable non-standard exotic objects. Yet Type() which the Web IDL spec depends on returns Object for
       // such cases. So treat the default case as an object.
       return "Object";
@@ -402,11 +400,19 @@ converters.DOMString = function (V, prefix, context, opts = {}) {
   return String(V);
 };
 
-// deno-lint-ignore no-control-regex
-const IS_BYTE_STRING = new SafeRegExp(/^[\x00-\xFF]*$/);
+function isByteString(input) {
+  for (let i = 0; i < input.length; i++) {
+    if (StringPrototypeCharCodeAt(input, i) > 255) {
+      // If a character code is greater than 255, it means the string is not a byte string.
+      return false;
+    }
+  }
+  return true;
+}
+
 converters.ByteString = (V, prefix, context, opts) => {
   const x = converters.DOMString(V, prefix, context, opts);
-  if (!RegExpPrototypeTest(IS_BYTE_STRING, x)) {
+  if (!isByteString(x)) {
     throw makeException(
       TypeError,
       "is not a valid ByteString",
@@ -1132,36 +1138,42 @@ function mixinPairIterable(name, prototype, dataSymbol, keyKey, valueKey) {
   return ObjectDefineProperties(prototype.prototype, properties);
 }
 
-function configurePrototype(prototype) {
-  const descriptors = ObjectGetOwnPropertyDescriptors(prototype.prototype);
+function configureInterface(interface_) {
+  configureProperties(interface_);
+  configureProperties(interface_.prototype);
+  ObjectDefineProperty(interface_.prototype, SymbolToStringTag, {
+    value: interface_.name,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+}
+
+function configureProperties(obj) {
+  const descriptors = ObjectGetOwnPropertyDescriptors(obj);
   for (const key in descriptors) {
     if (!ObjectHasOwn(descriptors, key)) {
       continue;
     }
     if (key === "constructor") continue;
+    if (key === "prototype") continue;
     const descriptor = descriptors[key];
     if (
       ReflectHas(descriptor, "value") &&
       typeof descriptor.value === "function"
     ) {
-      ObjectDefineProperty(prototype.prototype, key, {
+      ObjectDefineProperty(obj, key, {
         enumerable: true,
         writable: true,
         configurable: true,
       });
     } else if (ReflectHas(descriptor, "get")) {
-      ObjectDefineProperty(prototype.prototype, key, {
+      ObjectDefineProperty(obj, key, {
         enumerable: true,
         configurable: true,
       });
     }
   }
-  ObjectDefineProperty(prototype.prototype, SymbolToStringTag, {
-    value: prototype.name,
-    enumerable: false,
-    configurable: true,
-    writable: false,
-  });
 }
 
 const setlikeInner = Symbol("[[set]]");
@@ -1269,7 +1281,7 @@ function setlike(obj, objPrototype, readonly) {
 export {
   assertBranded,
   brand,
-  configurePrototype,
+  configureInterface,
   converters,
   createBranded,
   createDictionaryConverter,

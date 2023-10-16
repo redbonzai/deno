@@ -5,9 +5,10 @@ use crate::permissions::PermissionsContainer;
 use crate::worker::ExitCode;
 use deno_core::error::type_error;
 use deno_core::error::AnyError;
-use deno_core::op;
+use deno_core::op2;
 use deno_core::url::Url;
 use deno_core::v8;
+use deno_core::Op;
 use deno_core::OpState;
 use deno_node::NODE_ENV_VAR_ALLOWLIST;
 use serde::Serialize;
@@ -30,7 +31,6 @@ deno_core::ops!(
     op_network_interfaces,
     op_os_release,
     op_os_uptime,
-    op_node_unstable_os_uptime,
     op_set_env,
     op_set_exit_code,
     op_system_memory_info,
@@ -48,27 +48,20 @@ deno_core::extension!(
   state = |state, options| {
     state.put::<ExitCode>(options.exit_code);
   },
-  customizer = |ext: &mut deno_core::ExtensionBuilder| {
-    ext.force_op_registration();
-  }
 );
 
 deno_core::extension!(
   deno_os_worker,
   ops_fn = deno_ops,
   middleware = |op| match op.name {
-    "op_exit" | "op_set_exit_code" => deno_core::OpDecl {
-      v8_fn_ptr: deno_core::op_void_sync::v8_fn_ptr as _,
-      ..op
-    },
+    "op_exit" | "op_set_exit_code" =>
+      op.with_implementation_from(&deno_core::op_void_sync::DECL),
     _ => op,
   },
-  customizer = |ext: &mut deno_core::ExtensionBuilder| {
-    ext.force_op_registration();
-  }
 );
 
-#[op]
+#[op2]
+#[string]
 fn op_exec_path(state: &mut OpState) -> Result<String, AnyError> {
   let current_exe = env::current_exe().unwrap();
   state
@@ -82,11 +75,11 @@ fn op_exec_path(state: &mut OpState) -> Result<String, AnyError> {
   into_string(path.into_os_string())
 }
 
-#[op]
+#[op2(fast)]
 fn op_set_env(
   state: &mut OpState,
-  key: &str,
-  value: &str,
+  #[string] key: &str,
+  #[string] value: &str,
 ) -> Result<(), AnyError> {
   state.borrow_mut::<PermissionsContainer>().check_env(key)?;
   if key.is_empty() {
@@ -106,16 +99,18 @@ fn op_set_env(
   Ok(())
 }
 
-#[op]
+#[op2]
+#[serde]
 fn op_env(state: &mut OpState) -> Result<HashMap<String, String>, AnyError> {
   state.borrow_mut::<PermissionsContainer>().check_env_all()?;
   Ok(env::vars().collect())
 }
 
-#[op]
+#[op2]
+#[string]
 fn op_get_env(
   state: &mut OpState,
-  key: String,
+  #[string] key: String,
 ) -> Result<Option<String>, AnyError> {
   let skip_permission_check = NODE_ENV_VAR_ALLOWLIST.contains(&key);
 
@@ -140,8 +135,11 @@ fn op_get_env(
   Ok(r)
 }
 
-#[op]
-fn op_delete_env(state: &mut OpState, key: String) -> Result<(), AnyError> {
+#[op2(fast)]
+fn op_delete_env(
+  state: &mut OpState,
+  #[string] key: String,
+) -> Result<(), AnyError> {
   state.borrow_mut::<PermissionsContainer>().check_env(&key)?;
   if key.is_empty() || key.contains(&['=', '\0'] as &[char]) {
     return Err(type_error("Key contains invalid characters."));
@@ -150,18 +148,19 @@ fn op_delete_env(state: &mut OpState, key: String) -> Result<(), AnyError> {
   Ok(())
 }
 
-#[op]
-fn op_set_exit_code(state: &mut OpState, code: i32) {
+#[op2(fast)]
+fn op_set_exit_code(state: &mut OpState, #[smi] code: i32) {
   state.borrow_mut::<ExitCode>().set(code);
 }
 
-#[op]
+#[op2(fast)]
 fn op_exit(state: &mut OpState) {
   let code = state.borrow::<ExitCode>().get();
   std::process::exit(code)
 }
 
-#[op]
+#[op2]
+#[serde]
 fn op_loadavg(state: &mut OpState) -> Result<(f64, f64, f64), AnyError> {
   state
     .borrow_mut::<PermissionsContainer>()
@@ -169,7 +168,8 @@ fn op_loadavg(state: &mut OpState) -> Result<(f64, f64, f64), AnyError> {
   Ok(sys_info::loadavg())
 }
 
-#[op]
+#[op2]
+#[string]
 fn op_hostname(state: &mut OpState) -> Result<String, AnyError> {
   state
     .borrow_mut::<PermissionsContainer>()
@@ -177,7 +177,8 @@ fn op_hostname(state: &mut OpState) -> Result<String, AnyError> {
   Ok(sys_info::hostname())
 }
 
-#[op]
+#[op2]
+#[string]
 fn op_os_release(state: &mut OpState) -> Result<String, AnyError> {
   state
     .borrow_mut::<PermissionsContainer>()
@@ -185,7 +186,8 @@ fn op_os_release(state: &mut OpState) -> Result<String, AnyError> {
   Ok(sys_info::os_release())
 }
 
-#[op]
+#[op2]
+#[serde]
 fn op_network_interfaces(
   state: &mut OpState,
 ) -> Result<Vec<NetworkInterface>, AnyError> {
@@ -236,7 +238,8 @@ impl From<netif::Interface> for NetworkInterface {
   }
 }
 
-#[op]
+#[op2]
+#[serde]
 fn op_system_memory_info(
   state: &mut OpState,
 ) -> Result<Option<sys_info::MemInfo>, AnyError> {
@@ -247,7 +250,8 @@ fn op_system_memory_info(
 }
 
 #[cfg(not(windows))]
-#[op]
+#[op2]
+#[smi]
 fn op_gid(state: &mut OpState) -> Result<Option<u32>, AnyError> {
   state
     .borrow_mut::<PermissionsContainer>()
@@ -260,7 +264,8 @@ fn op_gid(state: &mut OpState) -> Result<Option<u32>, AnyError> {
 }
 
 #[cfg(windows)]
-#[op]
+#[op2]
+#[smi]
 fn op_gid(state: &mut OpState) -> Result<Option<u32>, AnyError> {
   state
     .borrow_mut::<PermissionsContainer>()
@@ -269,7 +274,8 @@ fn op_gid(state: &mut OpState) -> Result<Option<u32>, AnyError> {
 }
 
 #[cfg(not(windows))]
-#[op]
+#[op2]
+#[smi]
 fn op_uid(state: &mut OpState) -> Result<Option<u32>, AnyError> {
   state
     .borrow_mut::<PermissionsContainer>()
@@ -282,7 +288,8 @@ fn op_uid(state: &mut OpState) -> Result<Option<u32>, AnyError> {
 }
 
 #[cfg(windows)]
-#[op]
+#[op2]
+#[smi]
 fn op_uid(state: &mut OpState) -> Result<Option<u32>, AnyError> {
   state
     .borrow_mut::<PermissionsContainer>()
@@ -300,7 +307,8 @@ struct MemoryUsage {
   external: usize,
 }
 
-#[op(v8)]
+#[op2]
+#[serde]
 fn op_runtime_memory_usage(scope: &mut v8::HandleScope) -> MemoryUsage {
   let mut s = v8::HeapStatistics::default();
   scope.get_heap_statistics(&mut s);
@@ -386,6 +394,53 @@ fn rss() -> usize {
   task_info.resident_size as usize
 }
 
+#[cfg(target_os = "openbsd")]
+fn rss() -> usize {
+  // Uses OpenBSD's KERN_PROC_PID sysctl(2)
+  // to retrieve information about the current
+  // process, part of which is the RSS (p_vm_rssize)
+
+  // SAFETY: libc call (get PID of own process)
+  let pid = unsafe { libc::getpid() };
+  // SAFETY: libc call (get system page size)
+  let pagesize = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+  // KERN_PROC_PID returns a struct libc::kinfo_proc
+  let mut kinfoproc = std::mem::MaybeUninit::<libc::kinfo_proc>::uninit();
+  let mut size = std::mem::size_of_val(&kinfoproc) as libc::size_t;
+  let mut mib = [
+    libc::CTL_KERN,
+    libc::KERN_PROC,
+    libc::KERN_PROC_PID,
+    pid,
+    // mib is an array of integers, size is of type size_t
+    // conversion is safe, because the size of a libc::kinfo_proc
+    // structure will not exceed i32::MAX
+    size.try_into().unwrap(),
+    1,
+  ];
+  // SAFETY: libc call, mib has been statically initialized,
+  // kinfoproc is a valid pointer to a libc::kinfo_proc struct
+  let res = unsafe {
+    libc::sysctl(
+      mib.as_mut_ptr(),
+      mib.len() as _,
+      kinfoproc.as_mut_ptr() as *mut libc::c_void,
+      &mut size,
+      std::ptr::null_mut(),
+      0,
+    )
+  };
+
+  if res == 0 {
+    // SAFETY: sysctl returns 0 on success and kinfoproc is initialized
+    // p_vm_rssize contains size in pages -> multiply with pagesize to
+    // get size in bytes.
+    pagesize * unsafe { (*kinfoproc.as_mut_ptr()).p_vm_rssize as usize }
+  } else {
+    0
+  }
+}
+
 #[cfg(windows)]
 fn rss() -> usize {
   use winapi::shared::minwindef::DWORD;
@@ -420,12 +475,8 @@ fn os_uptime(state: &mut OpState) -> Result<u64, AnyError> {
   Ok(sys_info::os_uptime())
 }
 
-#[op]
+#[op2(fast)]
+#[number]
 fn op_os_uptime(state: &mut OpState) -> Result<u64, AnyError> {
-  os_uptime(state)
-}
-
-#[op]
-fn op_node_unstable_os_uptime(state: &mut OpState) -> Result<u64, AnyError> {
   os_uptime(state)
 }

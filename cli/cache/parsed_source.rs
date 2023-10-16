@@ -94,10 +94,6 @@ impl ParsedSourceCache {
     }
   }
 
-  pub fn clear(&self) {
-    self.sources.0.lock().clear();
-  }
-
   pub fn get_parsed_source_from_esm_module(
     &self,
     module: &deno_graph::EsmModule,
@@ -138,6 +134,18 @@ impl ParsedSourceCache {
   /// if it exists, or else parse.
   pub fn as_capturing_parser(&self) -> CapturingModuleParser {
     CapturingModuleParser::new(None, &self.sources)
+  }
+
+  pub fn cache_module_info(
+    &self,
+    specifier: &ModuleSpecifier,
+    media_type: MediaType,
+    source: &str,
+    module_info: &ModuleInfo,
+  ) -> Result<(), AnyError> {
+    let source_hash = compute_source_hash(source.as_bytes());
+    ParsedSourceCacheModuleAnalyzer::new(self.db.clone(), self.sources.clone())
+      .set_module_info(specifier, media_type, &source_hash, module_info)
   }
 }
 
@@ -266,7 +274,7 @@ impl deno_graph::ModuleAnalyzer for ParsedSourceCacheModuleAnalyzer {
 }
 
 fn compute_source_hash(bytes: &[u8]) -> String {
-  FastInsecureHasher::new().write(bytes).finish().to_string()
+  FastInsecureHasher::hash(bytes).to_string()
 }
 
 #[cfg(test)]

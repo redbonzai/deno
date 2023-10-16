@@ -6,6 +6,7 @@ import https from "node:https";
 import {
   assert,
   assertEquals,
+  fail,
 } from "../../../test_util/std/testing/asserts.ts";
 import { assertSpyCalls, spy } from "../../../test_util/std/testing/mock.ts";
 import { deferred } from "../../../test_util/std/async/deferred.ts";
@@ -140,8 +141,7 @@ Deno.test("[node/http] chunked response", async () => {
   }
 });
 
-// TODO(kt3k): This test case exercises the workaround for https://github.com/denoland/deno/issues/17194
-// This should be removed when #17194 is resolved.
+// Test empty chunks: https://github.com/denoland/deno/issues/17194
 Deno.test("[node/http] empty chunk in the middle of response", async () => {
   const promise = deferred<void>();
 
@@ -195,11 +195,14 @@ Deno.test("[node/http] request default protocol", async () => {
   // @ts-ignore IncomingMessageForClient
   // deno-lint-ignore no-explicit-any
   let clientRes: any;
+  // deno-lint-ignore no-explicit-any
+  let clientReq: any;
   server.listen(() => {
-    const req = http.request(
+    clientReq = http.request(
       // deno-lint-ignore no-explicit-any
       { host: "localhost", port: (server.address() as any).port },
       (res) => {
+        assert(res.socket instanceof EventEmitter);
         assertEquals(res.complete, false);
         res.on("data", () => {});
         res.on("end", () => {
@@ -210,13 +213,14 @@ Deno.test("[node/http] request default protocol", async () => {
         promise2.resolve();
       },
     );
-    req.end();
+    clientReq.end();
   });
   server.on("close", () => {
     promise.resolve();
   });
   await promise;
   await promise2;
+  assert(clientReq.socket instanceof EventEmitter);
   assertEquals(clientRes!.complete, true);
 });
 
@@ -256,6 +260,7 @@ Deno.test("[node/http] non-string buffer response", {
 }, async () => {
   const promise = deferred<void>();
   const server = http.createServer((_, res) => {
+    res.socket!.end();
     gzip(
       Buffer.from("a".repeat(100), "utf8"),
       {},
@@ -283,7 +288,7 @@ Deno.test("[node/http] non-string buffer response", {
 });
 
 // TODO(kt3k): Enable this test
-// Currently ImcomingMessage constructor has incompatible signature.
+// Currently IncomingMessage constructor has incompatible signature.
 /*
 Deno.test("[node/http] http.IncomingMessage can be created without url", () => {
   const message = new http.IncomingMessage(
@@ -344,6 +349,12 @@ Deno.test("[node/http] send request with non-chunked body", async () => {
     assertEquals(requestHeaders.get("content-length"), "11");
     assertEquals(requestHeaders.has("transfer-encoding"), false);
     assertEquals(requestBody, "hello world");
+  });
+  req.on("socket", (socket) => {
+    assert(socket.writable);
+    assert(socket.readable);
+    socket.setKeepAlive();
+    socket.destroy();
   });
   req.write("hello ");
   req.write("world");
@@ -596,3 +607,207 @@ Deno.test("[node/http] ClientRequest PUT", async () => {
   await def;
   assertEquals(body, "hello world");
 });
+
+Deno.test("[node/http] ClientRequest search params", async () => {
+  let body = "";
+  const def = deferred();
+  const req = http.request({
+    host: "localhost:4545",
+    path: "search_params?foo=bar",
+  }, (resp) => {
+    resp.on("data", (chunk) => {
+      body += chunk;
+    });
+
+    resp.on("end", () => {
+      def.resolve();
+    });
+  });
+  req.once("error", (e) => def.reject(e));
+  req.end();
+  await def;
+  assertEquals(body, "foo=bar");
+});
+
+Deno.test("[node/http] HTTPS server", async () => {
+  const promise = deferred<void>();
+  const promise2 = deferred<void>();
+  const client = Deno.createHttpClient({
+    caCerts: [Deno.readTextFileSync("cli/tests/testdata/tls/RootCA.pem")],
+  });
+  const server = https.createServer({
+    cert: Deno.readTextFileSync("cli/tests/testdata/tls/localhost.crt"),
+    key: Deno.readTextFileSync("cli/tests/testdata/tls/localhost.key"),
+  }, (req, res) => {
+    // @ts-ignore: It exists on TLSSocket
+    assert(req.socket.encrypted);
+    res.end("success!");
+  });
+  server.listen(() => {
+    // deno-lint-ignore no-explicit-any
+    fetch(`https://localhost:${(server.address() as any).port}`, {
+      client,
+    }).then(async (res) => {
+      assertEquals(res.status, 200);
+      assertEquals(await res.text(), "success!");
+      server.close();
+      promise2.resolve();
+    });
+  })
+    .on("error", () => fail());
+  server.on("close", () => {
+    promise.resolve();
+  });
+  await Promise.all([promise, promise2]);
+  client.close();
+});
+
+Deno.test(
+  "[node/http] client upgrade",
+  { permissions: { net: true } },
+  async () => {
+    const promise = deferred();
+    const server = http.createServer((req, res) => {
+      // @ts-ignore: It exists on TLSSocket
+      assert(!req.socket.encrypted);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("okay");
+    });
+    // @ts-ignore it's a socket for real
+    let serverSocket;
+    server.on("upgrade", (_req, socket, _head) => {
+      socket.write(
+        "HTTP/1.1 101 Web Socket Protocol Handshake\r\n" +
+          "Upgrade: WebSocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          "\r\n",
+      );
+      serverSocket = socket;
+    });
+
+    // Now that server is running
+    server.listen(1337, "127.0.0.1", () => {
+      // make a request
+      const options = {
+        port: 1337,
+        host: "127.0.0.1",
+        headers: {
+          "Connection": "Upgrade",
+          "Upgrade": "websocket",
+        },
+      };
+
+      const req = http.request(options);
+      req.end();
+
+      req.on("upgrade", (_res, socket, _upgradeHead) => {
+        socket.end();
+        // @ts-ignore it's a socket for real
+        serverSocket!.end();
+        server.close(() => {
+          promise.resolve();
+        });
+      });
+    });
+
+    await promise;
+  },
+);
+
+Deno.test(
+  "[node/http] client end with callback",
+  { permissions: { net: true } },
+  async () => {
+    let received = false;
+    const ac = new AbortController();
+    const server = Deno.serve({ port: 5928, signal: ac.signal }, (_req) => {
+      received = true;
+      return new Response("hello");
+    });
+    const promise = deferred();
+    let body = "";
+
+    const request = http.request(
+      "http://localhost:5928/",
+      (resp) => {
+        resp.on("data", (chunk) => {
+          body += chunk;
+        });
+
+        resp.on("end", () => {
+          promise.resolve();
+        });
+      },
+    );
+    request.on("error", promise.reject);
+    request.end(() => {
+      assert(received);
+    });
+
+    await promise;
+    ac.abort();
+    await server.finished;
+
+    assertEquals(body, "hello");
+  },
+);
+
+Deno.test("[node/http] server emits error if addr in use", async () => {
+  const promise = deferred<void>();
+  const promise2 = deferred<Error>();
+
+  const server = http.createServer();
+  server.listen(9001);
+
+  const server2 = http.createServer();
+  server2.on("error", (e) => {
+    promise2.resolve(e);
+  });
+  server2.listen(9001);
+
+  const err = await promise2;
+  server.close(() => promise.resolve());
+  server2.close();
+  await promise;
+  const expectedMsg = Deno.build.os === "windows"
+    ? "Only one usage of each socket address"
+    : "Address already in use";
+  assert(
+    err.message.startsWith(expectedMsg),
+    `Wrong error: ${err.message}`,
+  );
+});
+
+Deno.test(
+  "[node/http] client destroy doesn't leak",
+  { permissions: { net: true } },
+  async () => {
+    const ac = new AbortController();
+    let timerId;
+
+    const server = Deno.serve(
+      { port: 5929, signal: ac.signal },
+      async (_req) => {
+        await new Promise((resolve) => {
+          timerId = setTimeout(resolve, 5000);
+        });
+        return new Response("hello");
+      },
+    );
+    const promise = deferred();
+
+    const request = http.request("http://localhost:5929/");
+    request.on("error", promise.reject);
+    request.on("close", () => {});
+    request.end();
+    setTimeout(() => {
+      request.destroy(new Error());
+      promise.resolve();
+    }, 100);
+
+    await promise;
+    clearTimeout(timerId);
+    ac.abort();
+    await server.finished;
+  },
+);

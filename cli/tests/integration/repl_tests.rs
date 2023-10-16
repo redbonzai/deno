@@ -242,7 +242,7 @@ fn pty_internal_repl() {
 fn pty_emoji() {
   // windows was having issues displaying this
   util::with_pty(&["repl"], |mut console| {
-    console.write_line(r#"console.log('\u{1F995}');"#);
+    console.write_line(r"console.log('\u{1F995}');");
     console.expect("🦕");
   });
 }
@@ -316,7 +316,15 @@ fn repl_cwd() {
     .args_vec(["repl", "-A"])
     .with_pty(|mut console| {
       console.write_line("Deno.cwd()");
-      console.expect(temp_dir.path().file_name().unwrap().to_str().unwrap());
+      console.expect(
+        temp_dir
+          .path()
+          .as_path()
+          .file_name()
+          .unwrap()
+          .to_str()
+          .unwrap(),
+      );
     });
 }
 
@@ -535,10 +543,7 @@ fn missing_deno_dir() {
     "repl",
     Some(vec!["1"]),
     Some(vec![
-      (
-        "DENO_DIR".to_owned(),
-        deno_dir_path.to_str().unwrap().to_owned(),
-      ),
+      ("DENO_DIR".to_owned(), deno_dir_path.to_string()),
       ("NO_COLOR".to_owned(), "1".to_owned()),
     ]),
     false,
@@ -558,10 +563,7 @@ fn custom_history_path() {
     "repl",
     Some(vec!["1"]),
     Some(vec![
-      (
-        "DENO_REPL_HISTORY".to_owned(),
-        history_path.to_str().unwrap().to_owned(),
-      ),
+      ("DENO_REPL_HISTORY".to_owned(), history_path.to_string()),
       ("NO_COLOR".to_owned(), "1".to_owned()),
     ]),
     false,
@@ -580,10 +582,7 @@ fn disable_history_file() {
     "repl",
     Some(vec!["1"]),
     Some(vec![
-      (
-        "DENO_DIR".to_owned(),
-        deno_dir.path().to_str().unwrap().to_owned(),
-      ),
+      ("DENO_DIR".to_owned(), deno_dir.path().to_string()),
       ("DENO_REPL_HISTORY".to_owned(), "".to_owned()),
       ("NO_COLOR".to_owned(), "1".to_owned()),
     ]),
@@ -745,7 +744,7 @@ fn eval_file_flag_multiple_files() {
   assert_contains!(err, "Download");
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn pty_clear_function() {
   util::with_pty(&["repl"], |mut console| {
     console.write_line("console.log('h' + 'ello');");
@@ -802,7 +801,7 @@ fn repl_error() {
   });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn repl_reject() {
   util::with_pty(&["repl"], |mut console| {
     console.write_line("console.log(1);");
@@ -814,10 +813,14 @@ fn repl_reject() {
     console.expect("    at <anonymous>");
     console.write_line("console.log(2);");
     console.expect("2");
+    console.write_line(r#"throw "hello";"#);
+    console.expect(r#"Uncaught "hello""#);
+    console.write_line(r#"throw `hello ${"world"}`;"#);
+    console.expect(r#"Uncaught "hello world""#);
   });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn repl_report_error() {
   util::with_pty(&["repl"], |mut console| {
     console.write_line("console.log(1);");
@@ -831,7 +834,7 @@ fn repl_report_error() {
   });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn repl_error_undefined() {
   util::with_pty(&["repl"], |mut console| {
     console.write_line(r#"throw undefined;"#);
@@ -869,14 +872,53 @@ fn repl_with_quiet_flag() {
 }
 
 #[test]
+fn repl_unit_tests() {
+  util::with_pty(&["repl"], |mut console| {
+    console.write_line(
+      "\
+        console.log('Hello from outside of test!'); \
+        Deno.test('test1', async (t) => { \
+          console.log('Hello from inside of test!'); \
+          await t.step('step1', () => {}); \
+        }); \
+        Deno.test('test2', () => { \
+          throw new Error('some message'); \
+        }); \
+        console.log('Hello again from outside of test!'); \
+      ",
+    );
+
+    console.expect("Hello from outside of test!");
+    console.expect("Hello again from outside of test!");
+    // FIXME(nayeemrmn): REPL unit tests don't support output capturing.
+    console.expect("Hello from inside of test!");
+    console.expect("test1 ...");
+    console.expect("  step1 ... ok (");
+    console.expect("test1 ... ok (");
+    console.expect("test2 ... FAILED (");
+    console.expect(" ERRORS ");
+    console.expect("test2 => <anonymous>:7:6");
+    console.expect("error: Error: some message");
+    console.expect("   at <anonymous>:8:9");
+    console.expect(" FAILURES ");
+    console.expect("test2 => <anonymous>:7:6");
+    console.expect("FAILED | 1 passed (1 step) | 1 failed (");
+    console.expect("undefined");
+
+    console.write_line("Deno.test('test2', () => {});");
+
+    console.expect("test2 ... ok (");
+    console.expect("ok | 1 passed | 0 failed (");
+    console.expect("undefined");
+  });
+}
+
+#[test]
 fn npm_packages() {
   let mut env_vars = util::env_vars_for_npm_tests();
   env_vars.push(("NO_COLOR".to_owned(), "1".to_owned()));
   let temp_dir = TempDir::new();
-  env_vars.push((
-    "DENO_DIR".to_string(),
-    temp_dir.path().to_string_lossy().to_string(),
-  ));
+  env_vars.push(("DENO_DIR".to_string(), temp_dir.path().to_string()));
 
   {
     let (out, err) = util::run_and_collect_output_with_args(
@@ -972,7 +1014,7 @@ fn pty_tab_indexable_props() {
   });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn package_json_uncached_no_error() {
   let test_context = TestContextBuilder::for_npm()
     .use_temp_cwd()

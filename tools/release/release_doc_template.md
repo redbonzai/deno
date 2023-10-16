@@ -162,21 +162,12 @@ verify on GitHub that everything looks correct.
 
 - [ ] Publish the release on Github
 
-- [ ] Run the
-      https://github.com/denoland/dotcom/actions/workflows/update_versions.yml
-      workflow.
-  - [ ] This should open a PR. Review and merge it.
+- [ ] Update https://github.com/denoland/dotcom/blob/main/versions.json, open a
+      PR and merge.
 
-  <details>
-     <summary>Failure Steps</summary>
-
-  1. Update https://github.com/denoland/dotcom/blob/main/versions.json manually.
-  2. Open a PR and merge.
-  </details>
-
-- [ ] Push a new tag to [`manual`](https://github.com/denoland/manual). The tag
-      must match the CLI tag; you don't need to create dedicated commit for that
-      purpose, it's enough to tag the latest commit in that repo.
+- [ ] Run
+      https://github.com/denoland/deno-docs/actions/workflows/update_versions.yml
+      and merge the PR.
 
 - [ ] For minor releases: make sure https://github.com/mdn/browser-compat-data
       has been updated to reflect Web API changes in this release. Usually done
@@ -197,7 +188,7 @@ script generates the symbols based on the latest tags.
   <details>
      <summary>Failure Steps</summary>
 
-  1. Clone `deno/apliland_scripts`.
+  1. Clone `deno/apiland_scripts`.
   2. Execute `deno task release`.
   </details>
 

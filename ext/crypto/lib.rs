@@ -8,11 +8,12 @@ use deno_core::error::custom_error;
 use deno_core::error::not_supported;
 use deno_core::error::type_error;
 use deno_core::error::AnyError;
-use deno_core::op;
+use deno_core::op2;
+use deno_core::ToJsBuffer;
 
-use deno_core::task::spawn_blocking;
+use deno_core::unsync::spawn_blocking;
+use deno_core::JsBuffer;
 use deno_core::OpState;
-use deno_core::ZeroCopyBuf;
 use serde::Deserialize;
 use shared::operation_error;
 
@@ -44,7 +45,6 @@ use sha2::Sha512;
 use signature::RandomizedSigner;
 use signature::Signer;
 use signature::Verifier;
-use std::convert::TryFrom;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
@@ -69,7 +69,7 @@ use crate::key::Algorithm;
 use crate::key::CryptoHash;
 use crate::key::CryptoNamedCurve;
 use crate::key::HkdfOutput;
-use crate::shared::RawKeyData;
+use crate::shared::V8RawKeyData;
 
 deno_core::extension!(deno_crypto,
   deps = [ deno_webidl, deno_web ],
@@ -115,23 +115,26 @@ deno_core::extension!(deno_crypto,
   },
 );
 
-#[op]
-pub fn op_crypto_base64url_decode(data: String) -> ZeroCopyBuf {
-  let data: Vec<u8> =
-    base64::decode_config(data, base64::URL_SAFE_NO_PAD).unwrap();
-  data.into()
+#[op2]
+#[serde]
+pub fn op_crypto_base64url_decode(
+  #[string] data: String,
+) -> Result<ToJsBuffer, AnyError> {
+  let data: Vec<u8> = base64::decode_config(data, base64::URL_SAFE_NO_PAD)?;
+  Ok(data.into())
 }
 
-#[op]
-pub fn op_crypto_base64url_encode(data: ZeroCopyBuf) -> String {
+#[op2]
+#[string]
+pub fn op_crypto_base64url_encode(#[buffer] data: JsBuffer) -> String {
   let data: String = base64::encode_config(data, base64::URL_SAFE_NO_PAD);
   data
 }
 
-#[op(fast)]
+#[op2(fast)]
 pub fn op_crypto_get_random_values(
   state: &mut OpState,
-  out: &mut [u8],
+  #[buffer] out: &mut [u8],
 ) -> Result<(), AnyError> {
   if out.len() > 65536 {
     return Err(
@@ -171,7 +174,7 @@ pub enum KeyType {
 #[serde(rename_all = "lowercase")]
 pub struct KeyData {
   r#type: KeyType,
-  data: ZeroCopyBuf,
+  data: JsBuffer,
 }
 
 #[derive(Deserialize)]
@@ -184,11 +187,12 @@ pub struct SignArg {
   named_curve: Option<CryptoNamedCurve>,
 }
 
-#[op]
+#[op2(async)]
+#[serde]
 pub async fn op_crypto_sign_key(
-  args: SignArg,
-  zero_copy: ZeroCopyBuf,
-) -> Result<ZeroCopyBuf, AnyError> {
+  #[serde] args: SignArg,
+  #[buffer] zero_copy: JsBuffer,
+) -> Result<ToJsBuffer, AnyError> {
   let data = &*zero_copy;
   let algorithm = args.algorithm;
 
@@ -296,14 +300,14 @@ pub struct VerifyArg {
   key: KeyData,
   algorithm: Algorithm,
   hash: Option<CryptoHash>,
-  signature: ZeroCopyBuf,
+  signature: JsBuffer,
   named_curve: Option<CryptoNamedCurve>,
 }
 
-#[op]
+#[op2(async)]
 pub async fn op_crypto_verify_key(
-  args: VerifyArg,
-  zero_copy: ZeroCopyBuf,
+  #[serde] args: VerifyArg,
+  #[buffer] zero_copy: JsBuffer,
 ) -> Result<bool, AnyError> {
   let data = &*zero_copy;
   let algorithm = args.algorithm;
@@ -413,14 +417,15 @@ pub struct DeriveKeyArg {
   public_key: Option<KeyData>,
   named_curve: Option<CryptoNamedCurve>,
   // HKDF
-  info: Option<ZeroCopyBuf>,
+  info: Option<JsBuffer>,
 }
 
-#[op]
+#[op2(async)]
+#[serde]
 pub async fn op_crypto_derive_bits(
-  args: DeriveKeyArg,
-  zero_copy: Option<ZeroCopyBuf>,
-) -> Result<ZeroCopyBuf, AnyError> {
+  #[serde] args: DeriveKeyArg,
+  #[buffer] zero_copy: Option<JsBuffer>,
+) -> Result<ToJsBuffer, AnyError> {
   let algorithm = args.algorithm;
   match algorithm {
     Algorithm::Pbkdf2 => {
@@ -581,7 +586,8 @@ fn read_rsa_public_key(key_data: KeyData) -> Result<RsaPublicKey, AnyError> {
   Ok(public_key)
 }
 
-#[op]
+#[op2]
+#[string]
 pub fn op_crypto_random_uuid(state: &mut OpState) -> Result<String, AnyError> {
   let maybe_seeded_rng = state.try_borrow_mut::<StdRng>();
   let uuid = if let Some(seeded_rng) = maybe_seeded_rng {
@@ -597,11 +603,12 @@ pub fn op_crypto_random_uuid(state: &mut OpState) -> Result<String, AnyError> {
   Ok(uuid.to_string())
 }
 
-#[op]
+#[op2(async)]
+#[serde]
 pub async fn op_crypto_subtle_digest(
-  algorithm: CryptoHash,
-  data: ZeroCopyBuf,
-) -> Result<ZeroCopyBuf, AnyError> {
+  #[serde] algorithm: CryptoHash,
+  #[buffer] data: JsBuffer,
+) -> Result<ToJsBuffer, AnyError> {
   let output = spawn_blocking(move || {
     digest::digest(algorithm.into(), &data)
       .as_ref()
@@ -616,15 +623,16 @@ pub async fn op_crypto_subtle_digest(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapUnwrapKeyArg {
-  key: RawKeyData,
+  key: V8RawKeyData,
   algorithm: Algorithm,
 }
 
-#[op]
+#[op2]
+#[serde]
 pub fn op_crypto_wrap_key(
-  args: WrapUnwrapKeyArg,
-  data: ZeroCopyBuf,
-) -> Result<ZeroCopyBuf, AnyError> {
+  #[serde] args: WrapUnwrapKeyArg,
+  #[buffer] data: JsBuffer,
+) -> Result<ToJsBuffer, AnyError> {
   let algorithm = args.algorithm;
 
   match algorithm {
@@ -649,11 +657,12 @@ pub fn op_crypto_wrap_key(
   }
 }
 
-#[op]
+#[op2]
+#[serde]
 pub fn op_crypto_unwrap_key(
-  args: WrapUnwrapKeyArg,
-  data: ZeroCopyBuf,
-) -> Result<ZeroCopyBuf, AnyError> {
+  #[serde] args: WrapUnwrapKeyArg,
+  #[buffer] data: JsBuffer,
+) -> Result<ToJsBuffer, AnyError> {
   let algorithm = args.algorithm;
   match algorithm {
     Algorithm::AesKw => {

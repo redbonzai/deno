@@ -7,6 +7,9 @@ import {
   fail,
 } from "./test_util.ts";
 
+const servePort = 4248;
+const serveUrl = `ws://localhost:${servePort}/`;
+
 Deno.test({ permissions: "none" }, function websocketPermissionless() {
   assertThrows(
     () => new WebSocket("ws://localhost"),
@@ -81,13 +84,13 @@ Deno.test(
       signal: ac.signal,
       onListen: () => listeningPromise.resolve(),
       hostname: "localhost",
-      port: 4246,
+      port: servePort,
     });
 
     await listeningPromise;
     const promise = deferred();
-    const ws = new WebSocket("ws://localhost:4246/");
-    assertEquals(ws.url, "ws://localhost:4246/");
+    const ws = new WebSocket(serveUrl);
+    assertEquals(ws.url, serveUrl);
     ws.onerror = () => fail();
     ws.onmessage = (e) => {
       assertEquals(e.data, "Hello");
@@ -100,7 +103,7 @@ Deno.test(
       promise.resolve();
     };
 
-    await Promise.all([promise, server]);
+    await Promise.all([promise, server.finished]);
     ws.close();
   },
 );
@@ -133,24 +136,74 @@ Deno.test({
     signal: ac.signal,
     onListen: () => listeningPromise.resolve(),
     hostname: "localhost",
-    port: 4247,
+    port: servePort,
   });
 
   await listeningPromise;
 
-  const ws = new WebSocket("ws://localhost:4247/");
-  assertEquals(ws.url, "ws://localhost:4247/");
+  const ws = new WebSocket(serveUrl);
+  assertEquals(ws.url, serveUrl);
   ws.onerror = () => fail();
   ws.onmessage = () => ws.send("bye");
   ws.onclose = () => {
     promise.resolve();
   };
-  await Promise.all([promise, server]);
+  await Promise.all([promise, server.finished]);
+});
+
+// https://github.com/denoland/deno/issues/19483
+Deno.test({
+  sanitizeOps: false,
+  sanitizeResources: false,
+}, async function websocketCloseFlushes() {
+  const promise = deferred();
+
+  const ac = new AbortController();
+  const listeningPromise = deferred();
+
+  const server = Deno.serve({
+    handler: (req) => {
+      const { response, socket } = Deno.upgradeWebSocket(req);
+      socket.onopen = () => socket.send("Hello");
+      socket.onmessage = () => {
+        socket.send("Bye");
+        socket.close();
+      };
+      socket.onclose = () => ac.abort();
+      socket.onerror = () => fail();
+      return response;
+    },
+    signal: ac.signal,
+    onListen: () => listeningPromise.resolve(),
+    hostname: "localhost",
+    port: servePort,
+  });
+
+  await listeningPromise;
+
+  const ws = new WebSocket(serveUrl);
+  assertEquals(ws.url, serveUrl);
+  let seenBye = false;
+  ws.onerror = () => fail();
+  ws.onmessage = ({ data }) => {
+    if (data == "Hello") {
+      ws.send("Hello!");
+    } else {
+      assertEquals(data, "Bye");
+      seenBye = true;
+    }
+  };
+  ws.onclose = () => {
+    promise.resolve();
+  };
+  await Promise.all([promise, server.finished]);
+
+  assert(seenBye);
 });
 
 Deno.test(
   { sanitizeOps: false },
-  function websocketConstructorWithPrototypePollusion() {
+  function websocketConstructorWithPrototypePollution() {
     const originalSymbolIterator = Array.prototype[Symbol.iterator];
     try {
       Array.prototype[Symbol.iterator] = () => {

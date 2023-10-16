@@ -1,12 +1,10 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
-// deno-lint-ignore-file camelcase
-
 const core = globalThis.Deno.core;
 const internals = globalThis.__bootstrap.internals;
 const primordials = globalThis.__bootstrap.primordials;
 const { BadResourcePrototype, InterruptedPrototype, ops } = core;
-const { op_http_write } = Deno.core.generateAsyncOpHandler("op_http_write");
+const { op_http_write } = Deno.core.ensureFastOps();
 import * as webidl from "ext:deno_webidl/00_webidl.js";
 import { InnerBody } from "ext:deno_fetch/22_body.js";
 import { Event, setEventTargetData } from "ext:deno_web/02_event.js";
@@ -293,7 +291,7 @@ function createRespondWith(
           if (respBody.locked) {
             throw new TypeError("ReadableStream is locked.");
           }
-          reader = respBody.getReader(); // Aquire JS lock.
+          reader = respBody.getReader(); // Acquire JS lock.
           try {
             await core.opAsync(
               "op_http_write_resource",

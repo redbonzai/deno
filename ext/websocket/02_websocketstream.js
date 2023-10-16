@@ -1,6 +1,5 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
-// deno-lint-ignore-file camelcase
 /// <reference path="../../core/internal.d.ts" />
 
 const core = globalThis.Deno.core;
@@ -34,18 +33,15 @@ const {
   Uint8ArrayPrototype,
 } = primordials;
 const {
-  op_ws_send_text,
-  op_ws_send_binary,
+  op_ws_send_text_async,
+  op_ws_send_binary_async,
   op_ws_next_event,
+  op_ws_get_buffer,
+  op_ws_get_buffer_as_string,
+  op_ws_get_error,
   op_ws_create,
   op_ws_close,
-} = core.generateAsyncOpHandler(
-  "op_ws_send_text",
-  "op_ws_send_binary",
-  "op_ws_next_event",
-  "op_ws_create",
-  "op_ws_close",
-);
+} = core.ensureFastOps();
 
 webidl.converters.WebSocketStreamOptions = webidl.createDictionaryConverter(
   "WebSocketStreamOptions",
@@ -86,7 +82,7 @@ const CLOSE_RESPONSE_TIMEOUT = 5000;
 
 const _rid = Symbol("[[rid]]");
 const _url = Symbol("[[url]]");
-const _connection = Symbol("[[connection]]");
+const _opened = Symbol("[[opened]]");
 const _closed = Symbol("[[closed]]");
 const _earlyClose = Symbol("[[earlyClose]]");
 const _closeSent = Symbol("[[closeSent]]");
@@ -159,7 +155,7 @@ class WebSocketStream {
     if (options.signal?.aborted) {
       core.close(cancelRid);
       const err = options.signal.reason;
-      this[_connection].reject(err);
+      this[_opened].reject(err);
       this[_closed].reject(err);
     } else {
       const abort = () => {
@@ -183,7 +179,7 @@ class WebSocketStream {
                 PromisePrototypeThen(
                   (async () => {
                     while (true) {
-                      const { 0: kind } = await op_ws_next_event(create.rid);
+                      const kind = await op_ws_next_event(create.rid);
 
                       if (kind > 5) {
                         /* close */
@@ -196,7 +192,7 @@ class WebSocketStream {
                       "Closed while connecting",
                       "NetworkError",
                     );
-                    this[_connection].reject(err);
+                    this[_opened].reject(err);
                     this[_closed].reject(err);
                   },
                 );
@@ -206,7 +202,7 @@ class WebSocketStream {
                   "Closed while connecting",
                   "NetworkError",
                 );
-                this[_connection].reject(err);
+                this[_opened].reject(err);
                 this[_closed].reject(err);
               },
             );
@@ -216,11 +212,11 @@ class WebSocketStream {
             const writable = new WritableStream({
               write: async (chunk) => {
                 if (typeof chunk === "string") {
-                  await op_ws_send_text(this[_rid], chunk);
+                  await op_ws_send_text_async(this[_rid], chunk);
                 } else if (
                   ObjectPrototypeIsPrototypeOf(Uint8ArrayPrototype, chunk)
                 ) {
-                  await op_ws_send_binary(this[_rid], chunk);
+                  await op_ws_send_binary_async(this[_rid], chunk);
                 } else {
                   throw new TypeError(
                     "A chunk may only be either a string or an Uint8Array",
@@ -245,14 +241,16 @@ class WebSocketStream {
               },
             });
             const pull = async (controller) => {
-              const { 0: kind, 1: value } = await op_ws_next_event(this[_rid]);
-
+              // Remember that this pull method may be re-entered before it has completed
+              const kind = await op_ws_next_event(this[_rid]);
               switch (kind) {
                 case 0:
-                case 1: {
                   /* string */
+                  controller.enqueue(op_ws_get_buffer_as_string(this[_rid]));
+                  break;
+                case 1: {
                   /* binary */
-                  controller.enqueue(value);
+                  controller.enqueue(op_ws_get_buffer(this[_rid]));
                   break;
                 }
                 case 2: {
@@ -261,23 +259,24 @@ class WebSocketStream {
                 }
                 case 3: {
                   /* error */
-                  const err = new Error(value);
+                  const err = new Error(op_ws_get_error(this[_rid]));
                   this[_closed].reject(err);
                   controller.error(err);
                   core.tryClose(this[_rid]);
                   break;
                 }
-                case 4: {
+                case 1005: {
                   /* closed */
-                  this[_closed].resolve(undefined);
+                  this[_closed].resolve({ code: 1005, reason: "" });
                   core.tryClose(this[_rid]);
                   break;
                 }
                 default: {
                   /* close */
+                  const reason = op_ws_get_error(this[_rid]);
                   this[_closed].resolve({
                     code: kind,
-                    reason: value,
+                    reason,
                   });
                   core.tryClose(this[_rid]);
                   break;
@@ -295,7 +294,8 @@ class WebSocketStream {
                   return pull(controller);
                 }
 
-                this[_closed].resolve(value);
+                const error = op_ws_get_error(this[_rid]);
+                this[_closed].reject(new Error(error));
                 core.tryClose(this[_rid]);
               }
             };
@@ -334,7 +334,7 @@ class WebSocketStream {
               },
             });
 
-            this[_connection].resolve({
+            this[_opened].resolve({
               readable,
               writable,
               extensions: create.extensions ?? "",
@@ -349,17 +349,17 @@ class WebSocketStream {
           } else {
             core.tryClose(cancelRid);
           }
-          this[_connection].reject(err);
+          this[_opened].reject(err);
           this[_closed].reject(err);
         },
       );
     }
   }
 
-  [_connection] = new Deferred();
-  get connection() {
+  [_opened] = new Deferred();
+  get opened() {
     webidl.assertBranded(this, WebSocketStreamPrototype);
-    return this[_connection].promise;
+    return this[_opened].promise;
   }
 
   [_earlyClose] = false;
@@ -405,7 +405,7 @@ class WebSocketStream {
       code = 1000;
     }
 
-    if (this[_connection].state === "pending") {
+    if (this[_opened].state === "pending") {
       this[_earlyClose] = true;
     } else if (this[_closed].state === "pending") {
       PromisePrototypeThen(

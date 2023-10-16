@@ -23,7 +23,6 @@ mod tools;
 mod tsc;
 mod util;
 mod version;
-mod watcher;
 mod worker;
 
 use crate::args::flags_from_vec;
@@ -33,15 +32,14 @@ use crate::util::display;
 use crate::util::v8::get_v8_flags_from_env;
 use crate::util::v8::init_v8_flags;
 
-use args::CliOptions;
 use deno_core::anyhow::Context;
 use deno_core::error::AnyError;
 use deno_core::error::JsError;
 use deno_core::futures::FutureExt;
-use deno_core::task::JoinHandle;
+use deno_core::unsync::JoinHandle;
 use deno_runtime::colors;
 use deno_runtime::fmt_errors::format_js_error;
-use deno_runtime::tokio_util::create_and_run_current_thread;
+use deno_runtime::tokio_util::create_and_run_current_thread_with_maybe_metrics;
 use factory::CliFactory;
 use std::env;
 use std::env::current_exe;
@@ -78,19 +76,19 @@ impl SubcommandOutput for Result<(), std::io::Error> {
 fn spawn_subcommand<F: Future<Output = T> + 'static, T: SubcommandOutput>(
   f: F,
 ) -> JoinHandle<Result<i32, AnyError>> {
-  deno_core::task::spawn(f.map(|r| r.output()))
+  // the boxed_local() is important in order to get windows to not blow the stack in debug
+  deno_core::unsync::spawn(
+    async move { f.map(|r| r.output()).await }.boxed_local(),
+  )
 }
 
 async fn run_subcommand(flags: Flags) -> Result<i32, AnyError> {
   let handle = match flags.subcommand.clone() {
     DenoSubcommand::Bench(bench_flags) => spawn_subcommand(async {
-      let cli_options = CliOptions::from_flags(flags)?;
-      let bench_options = cli_options.resolve_bench_options(bench_flags)?;
-      if cli_options.watch_paths().is_some() {
-        tools::bench::run_benchmarks_with_watch(cli_options, bench_options)
-          .await
+      if bench_flags.watch.is_some() {
+        tools::bench::run_benchmarks_with_watch(flags, bench_flags).await
       } else {
-        tools::bench::run_benchmarks(cli_options, bench_options).await
+        tools::bench::run_benchmarks(flags, bench_flags).await
       }
     }),
     DenoSubcommand::Bundle(bundle_flags) => spawn_subcommand(async {
@@ -125,11 +123,11 @@ async fn run_subcommand(flags: Flags) -> Result<i32, AnyError> {
     DenoSubcommand::Coverage(coverage_flags) => spawn_subcommand(async {
       tools::coverage::cover_files(flags, coverage_flags).await
     }),
-    DenoSubcommand::Fmt(fmt_flags) => spawn_subcommand(async move {
-      let cli_options = CliOptions::from_flags(flags.clone())?;
-      let fmt_options = cli_options.resolve_fmt_options(fmt_flags)?;
-      tools::fmt::format(cli_options, fmt_options).await
-    }),
+    DenoSubcommand::Fmt(fmt_flags) => {
+      spawn_subcommand(
+        async move { tools::fmt::format(flags, fmt_flags).await },
+      )
+    }
     DenoSubcommand::Init(init_flags) => {
       spawn_subcommand(async { tools::init::init_project(init_flags).await })
     }
@@ -139,18 +137,22 @@ async fn run_subcommand(flags: Flags) -> Result<i32, AnyError> {
     DenoSubcommand::Install(install_flags) => spawn_subcommand(async {
       tools::installer::install_command(flags, install_flags).await
     }),
+    DenoSubcommand::Jupyter(jupyter_flags) => spawn_subcommand(async {
+      tools::jupyter::kernel(flags, jupyter_flags).await
+    }),
     DenoSubcommand::Uninstall(uninstall_flags) => spawn_subcommand(async {
       tools::installer::uninstall(uninstall_flags.name, uninstall_flags.root)
     }),
     DenoSubcommand::Lsp => spawn_subcommand(async { lsp::start().await }),
     DenoSubcommand::Lint(lint_flags) => spawn_subcommand(async {
       if lint_flags.rules {
-        tools::lint::print_rules_list(lint_flags.json);
+        tools::lint::print_rules_list(
+          lint_flags.json,
+          lint_flags.maybe_rules_tags,
+        );
         Ok(())
       } else {
-        let cli_options = CliOptions::from_flags(flags)?;
-        let lint_options = cli_options.resolve_lint_options(lint_flags)?;
-        tools::lint::lint(cli_options, lint_options).await
+        tools::lint::lint(flags, lint_flags).await
       }
     }),
     DenoSubcommand::Repl(repl_flags) => {
@@ -160,7 +162,7 @@ async fn run_subcommand(flags: Flags) -> Result<i32, AnyError> {
       if run_flags.is_stdin() {
         tools::run::run_from_stdin(flags).await
       } else {
-        tools::run::run_script(flags).await
+        tools::run::run_script(flags, run_flags).await
       }
     }),
     DenoSubcommand::Task(task_flags) => spawn_subcommand(async {
@@ -168,7 +170,7 @@ async fn run_subcommand(flags: Flags) -> Result<i32, AnyError> {
     }),
     DenoSubcommand::Test(test_flags) => {
       spawn_subcommand(async {
-        if let Some(ref coverage_dir) = flags.coverage_dir {
+        if let Some(ref coverage_dir) = test_flags.coverage_dir {
           std::fs::create_dir_all(coverage_dir)
             .with_context(|| format!("Failed creating: {coverage_dir}"))?;
           // this is set in order to ensure spawned processes use the same
@@ -178,13 +180,11 @@ async fn run_subcommand(flags: Flags) -> Result<i32, AnyError> {
             PathBuf::from(coverage_dir).canonicalize()?,
           );
         }
-        let cli_options = CliOptions::from_flags(flags)?;
-        let test_options = cli_options.resolve_test_options(test_flags)?;
 
-        if cli_options.watch_paths().is_some() {
-          tools::test::run_tests_with_watch(cli_options, test_options).await
+        if test_flags.watch.is_some() {
+          tools::test::run_tests_with_watch(flags, test_flags).await
         } else {
-          tools::test::run_tests(cli_options, test_options).await
+          tools::test::run_tests(flags, test_flags).await
         }
       })
     }
@@ -256,6 +256,19 @@ fn unwrap_or_exit<T>(result: Result<T, AnyError>) -> T {
   }
 }
 
+pub(crate) fn unstable_exit_cb(_feature: &str, api_name: &str) {
+  // TODO(bartlomieju): change to "The `--unstable-{feature}` flag must be provided.".
+  eprintln!("Unstable API '{api_name}'. The --unstable flag must be provided.");
+  std::process::exit(70);
+}
+
+#[allow(dead_code)]
+pub(crate) fn unstable_warn_cb(feature: &str) {
+  eprintln!(
+    "The `--unstable` flag is deprecated, use --unstable-{feature} instead."
+  );
+}
+
 pub fn main() {
   setup_panic_hook();
 
@@ -269,6 +282,10 @@ pub fn main() {
   );
 
   let args: Vec<String> = env::args().collect();
+
+  // NOTE(lucacasonato): due to new PKU feature introduced in V8 11.6 we need to
+  // initalize the V8 platform on a parent thread of all threads that will spawn
+  // V8 isolates.
 
   let future = async move {
     let current_exe_path = current_exe()?;
@@ -302,13 +319,15 @@ pub fn main() {
       _ => vec![],
     };
     init_v8_flags(&default_v8_flags, &flags.v8_flags, get_v8_flags_from_env());
+    deno_core::JsRuntime::init_platform(None);
 
     util::logger::init(flags.log_level);
 
     run_subcommand(flags).await
   };
 
-  let exit_code = unwrap_or_exit(create_and_run_current_thread(future));
+  let exit_code =
+    unwrap_or_exit(create_and_run_current_thread_with_maybe_metrics(future));
 
   std::process::exit(exit_code);
 }
