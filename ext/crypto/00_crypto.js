@@ -10,6 +10,7 @@ const core = globalThis.Deno.core;
 const ops = core.ops;
 const primordials = globalThis.__bootstrap.primordials;
 import * as webidl from "ext:deno_webidl/00_webidl.js";
+import { createFilteredInspectProxy } from "ext:deno_console/01_console.js";
 import DOMException from "ext:deno_web/01_dom_exception.js";
 const {
   ArrayBufferIsView,
@@ -349,15 +350,20 @@ class CryptoKey {
     return this[_algorithm];
   }
 
-  [SymbolFor("Deno.customInspect")](inspect) {
-    return `${this.constructor.name} ${
-      inspect({
-        type: this.type,
-        extractable: this.extractable,
-        algorithm: this.algorithm,
-        usages: this.usages,
-      })
-    }`;
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(CryptoKeyPrototype, this),
+        keys: [
+          "type",
+          "extractable",
+          "algorithm",
+          "usages",
+        ],
+      }),
+      inspectOptions,
+    );
   }
 }
 
@@ -1313,6 +1319,7 @@ class SubtleCrypto {
           algorithm: "RSA-PSS",
           hash: hashAlgorithm,
           signature,
+          saltLength: normalizedAlgorithm.saltLength,
         }, data);
       }
       case "HMAC": {
@@ -1708,6 +1715,10 @@ class SubtleCrypto {
     }
 
     return result;
+  }
+
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return `${this.constructor.name} ${inspect({}, inspectOptions)}`;
   }
 }
 const SubtleCryptoPrototype = SubtleCrypto.prototype;
@@ -4729,8 +4740,15 @@ class Crypto {
     return subtle;
   }
 
-  [SymbolFor("Deno.customInspect")](inspect) {
-    return `${this.constructor.name} ${inspect({})}`;
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(CryptoPrototype, this),
+        keys: ["subtle"],
+      }),
+      inspectOptions,
+    );
   }
 }
 

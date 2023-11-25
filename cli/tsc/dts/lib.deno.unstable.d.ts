@@ -925,7 +925,7 @@ declare namespace Deno {
 
   /** **UNSTABLE**: New API, yet to be vetted.
    *
-   * Create a custom HttpClient for to use with {@linkcode fetch}. This is an
+   * Create a custom HttpClient to use with {@linkcode fetch}. This is an
    * extension of the web platform Fetch API which allows Deno to use custom
    * TLS certificates and connect via a proxy while using `fetch()`.
    *
@@ -1316,6 +1316,86 @@ declare namespace Deno {
    * @category KV
    */
   export function openKv(path?: string): Promise<Deno.Kv>;
+
+  /** **UNSTABLE**: New API, yet to be vetted.
+   *
+   * Create a cron job that will periodically execute the provided handler
+   * callback based on the specified schedule.
+   *
+   * ```ts
+   * Deno.cron("sample cron", "20 * * * *", () => {
+   *   console.log("cron job executed");
+   * });
+   * ```
+   * `backoffSchedule` option can be used to specify the retry policy for failed
+   * executions. Each element in the array represents the number of milliseconds
+   * to wait before retrying the execution. For example, `[1000, 5000, 10000]`
+   * means that a failed execution will be retried at most 3 times, with 1
+   * second, 5 seconds, and 10 seconds delay between each retry.
+   *
+   * @category Cron
+   * @deprecated Use other {@linkcode cron} overloads instead. This overload
+   * will be removed in the future.
+   */
+  export function cron(
+    name: string,
+    schedule: string,
+    handler: () => Promise<void> | void,
+    options: { backoffSchedule?: number[]; signal?: AbortSignal },
+  ): Promise<void>;
+
+  /** **UNSTABLE**: New API, yet to be vetted.
+   *
+   * Create a cron job that will periodically execute the provided handler
+   * callback based on the specified schedule.
+   *
+   * ```ts
+   * Deno.cron("sample cron", "20 * * * *", () => {
+   *   console.log("cron job executed");
+   * });
+   * ```
+   *
+   * `schedule` is a Unix cron format expression, where time is specified
+   * using UTC time zone.
+   *
+   * @category Cron
+   */
+  export function cron(
+    name: string,
+    schedule: string,
+    handler: () => Promise<void> | void,
+  ): Promise<void>;
+
+  /** **UNSTABLE**: New API, yet to be vetted.
+   *
+   * Create a cron job that will periodically execute the provided handler
+   * callback based on the specified schedule.
+   *
+   * ```ts
+   * Deno.cron("sample cron", "20 * * * *", {
+   *   backoffSchedule: [10, 20]
+   * }, () => {
+   *   console.log("cron job executed");
+   * });
+   * ```
+   *
+   * `schedule` is a Unix cron format expression, where time is specified
+   * using UTC time zone.
+   *
+   * `backoffSchedule` option can be used to specify the retry policy for failed
+   * executions. Each element in the array represents the number of milliseconds
+   * to wait before retrying the execution. For example, `[1000, 5000, 10000]`
+   * means that a failed execution will be retried at most 3 times, with 1
+   * second, 5 seconds, and 10 seconds delay between each retry.
+   *
+   * @category Cron
+   */
+  export function cron(
+    name: string,
+    schedule: string,
+    options: { backoffSchedule?: number[]; signal?: AbortSignal },
+    handler: () => Promise<void> | void,
+  ): Promise<void>;
 
   /** **UNSTABLE**: New API, yet to be vetted.
    *
@@ -1724,7 +1804,7 @@ declare namespace Deno {
    *
    * @category KV
    */
-  export class Kv {
+  export class Kv implements Disposable {
     /**
      * Retrieve the value and versionstamp for the given key from the database
      * in the form of a {@linkcode Deno.KvEntryMaybe}. If no value exists for
@@ -1920,6 +2000,8 @@ declare namespace Deno {
      * operations immediately.
      */
     close(): void;
+
+    [Symbol.dispose](): void;
   }
 
   /** **UNSTABLE**: New API, yet to be vetted.
@@ -1941,7 +2023,7 @@ declare namespace Deno {
    *
    * @category HTTP Server
    */
-  export interface Server {
+  export interface HttpServer {
     /** Gracefully close the server. No more new connections will be accepted,
      * while pending requests will be allowed to finish.
      */
@@ -2076,6 +2158,7 @@ declare namespace Deno {
    *
    * @category Jupyter */
   export namespace jupyter {
+    /** @category Jupyter */
     export interface DisplayOptions {
       raw?: boolean;
       update?: boolean;
@@ -2089,6 +2172,8 @@ declare namespace Deno {
 
     /**
      * A collection of supported media types and data for Jupyter frontends.
+     *
+     * @category Jupyter
      */
     export type MediaBundle = {
       "text/plain"?: string;
@@ -2118,8 +2203,10 @@ declare namespace Deno {
       [key: string]: string | object | undefined;
     };
 
+    /** @category Jupyter */
     export const $display: unique symbol;
 
+    /** @category Jupyter */
     export type Displayable = {
       [$display]: () => MediaBundle | Promise<MediaBundle>;
     };
@@ -2131,6 +2218,7 @@ declare namespace Deno {
      *
      * @param obj - The object to be displayed
      * @param options - Display options with a default { raw: true }
+     * @category Jupyter
      */
     export function display(obj: unknown, options?: DisplayOptions): void;
 
@@ -2153,6 +2241,8 @@ declare namespace Deno {
      * Interactive compute with Jupyter _built into Deno_!
      * `
      * ```
+     *
+     * @category Jupyter
      */
     export function md(
       strings: TemplateStringsArray,
@@ -2170,6 +2260,8 @@ declare namespace Deno {
      * const { html } = Deno.jupyter;
      * html`<h1>Hello, world!</h1>`
      * ```
+     *
+     * @category Jupyter
      */
     export function html(
       strings: TemplateStringsArray,
@@ -2186,6 +2278,8 @@ declare namespace Deno {
      * svg`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
      *      <circle cx="50" cy="50" r="40" stroke="green" stroke-width="4" fill="yellow" />
      *    </svg>`
+     *
+     * @category Jupyter
      */
     export function svg(
       strings: TemplateStringsArray,
@@ -2197,6 +2291,8 @@ declare namespace Deno {
      *
      * @param obj - The object to be displayed
      * @returns MediaBundle
+     *
+     * @category Jupyter
      */
     export function format(obj: unknown): MediaBundle;
 
