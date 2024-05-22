@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
 //! Code for local node_modules resolution.
 
@@ -122,14 +122,9 @@ impl LocalNpmPackageResolver {
     };
     // Canonicalize the path so it's not pointing to the symlinked directory
     // in `node_modules` directory of the referrer.
-    canonicalize_path_maybe_not_exists_with_fs(&path, |path| {
-      self
-        .fs
-        .realpath_sync(path)
-        .map_err(|err| err.into_io_error())
-    })
-    .map(Some)
-    .map_err(|err| err.into())
+    canonicalize_path_maybe_not_exists_with_fs(&path, self.fs.as_ref())
+      .map(Some)
+      .map_err(|err| err.into())
   }
 }
 
@@ -139,8 +134,8 @@ impl NpmPackageFsResolver for LocalNpmPackageResolver {
     &self.root_node_modules_url
   }
 
-  fn node_modules_path(&self) -> Option<PathBuf> {
-    Some(self.root_node_modules_path.clone())
+  fn node_modules_path(&self) -> Option<&PathBuf> {
+    Some(&self.root_node_modules_path)
   }
 
   fn package_folder(&self, id: &NpmPackageId) -> Result<PathBuf, AnyError> {
@@ -173,8 +168,8 @@ impl NpmPackageFsResolver for LocalNpmPackageResolver {
     };
     let package_root_path = self.resolve_package_root(&local_path);
     let mut current_folder = package_root_path.as_path();
-    loop {
-      current_folder = current_folder.parent().unwrap();
+    while let Some(parent_folder) = current_folder.parent() {
+      current_folder = parent_folder;
       let node_modules_folder = if current_folder.ends_with("node_modules") {
         Cow::Borrowed(current_folder)
       } else {
@@ -196,13 +191,15 @@ impl NpmPackageFsResolver for LocalNpmPackageResolver {
       }
 
       if current_folder == self.root_node_modules_path {
-        bail!(
-          "could not find package '{}' from referrer '{}'.",
-          name,
-          referrer
-        );
+        break;
       }
     }
+
+    bail!(
+      "could not find package '{}' from referrer '{}'.",
+      name,
+      referrer
+    );
   }
 
   fn resolve_package_folder_from_specifier(
@@ -337,8 +334,12 @@ async fn sync_resolution_with_fs(
           .with_context(|| format!("Creating '{}'", folder_path.display()))?;
         let cache_folder = cache
           .package_folder_for_name_and_version(&package.id.nv, &registry_url);
-        // for now copy, but in the future consider hard linking
-        copy_dir_recursive(&cache_folder, &package_path)?;
+        if hard_link_dir_recursive(&cache_folder, &package_path).is_err() {
+          // Fallback to copying the directory.
+          //
+          // Also handles EXDEV when when trying to hard link across volumes.
+          copy_dir_recursive(&cache_folder, &package_path)?;
+        }
         // write out a file that indicates this folder has been initialized
         fs::write(initialized_file, "")?;
         // finally stop showing the progress bar
@@ -393,10 +394,13 @@ async fn sync_resolution_with_fs(
       .join("node_modules");
     let mut dep_setup_cache = setup_cache.with_dep(&package_folder_name);
     for (name, dep_id) in &package.dependencies {
-      let dep_cache_folder_id = snapshot
-        .package_from_id(dep_id)
-        .unwrap()
-        .get_package_cache_folder_id();
+      let dep = snapshot.package_from_id(dep_id).unwrap();
+      if package.optional_dependencies.contains(name)
+        && !dep.system.matches_system(system_info)
+      {
+        continue; // this isn't a dependency for the current system
+      }
+      let dep_cache_folder_id = dep.get_package_cache_folder_id();
       let dep_folder_name =
         get_package_folder_id_folder_name(&dep_cache_folder_id);
       if dep_setup_cache.insert(name, &dep_folder_name) {

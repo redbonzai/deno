@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 use bytes::BytesMut;
 use deno_core::error::type_error;
 use deno_core::error::AnyError;
@@ -63,6 +63,13 @@ struct BoundedBufferChannelInner {
 impl Default for BoundedBufferChannelInner {
   fn default() -> Self {
     Self::new()
+  }
+}
+
+impl Drop for BoundedBufferChannelInner {
+  fn drop(&mut self) {
+    // If any buffers remain in the ring, drop them here
+    self.drain(std::mem::drop);
   }
 }
 
@@ -197,7 +204,14 @@ impl BoundedBufferChannelInner {
   pub fn write(&mut self, buffer: V8Slice<u8>) -> Result<(), V8Slice<u8>> {
     let next_producer_index = (self.ring_producer + 1) % BUFFER_CHANNEL_SIZE;
     if next_producer_index == self.ring_consumer {
-      return Err(buffer);
+      // Note that we may have been allowed to write because of a close/error condition, but the
+      // underlying channel is actually closed. If this is the case, we return `Ok(())`` and just
+      // drop the bytes on the floor.
+      return if self.closed || self.error.is_some() {
+        Ok(())
+      } else {
+        Err(buffer)
+      };
     }
 
     self.current_size += buffer.len();
@@ -336,6 +350,7 @@ struct ReadableStreamResource {
   channel: BoundedBufferChannel,
   cancel_handle: CancelHandle,
   data: ReadableStreamResourceData,
+  size_hint: (u64, Option<u64>),
 }
 
 impl ReadableStreamResource {
@@ -377,6 +392,10 @@ impl Resource for ReadableStreamResource {
 
   fn close(self: Rc<Self>) {
     self.close_channel();
+  }
+
+  fn size_hint(&self) -> (u64, Option<u64>) {
+    self.size_hint
   }
 }
 
@@ -438,6 +457,25 @@ pub fn op_readable_stream_resource_allocate(state: &mut OpState) -> ResourceId {
     cancel_handle: Default::default(),
     channel: BoundedBufferChannel::default(),
     data: ReadableStreamResourceData { completion },
+    size_hint: (0, None),
+  };
+  state.resource_table.add(resource)
+}
+
+/// Allocate a resource that wraps a ReadableStream, with a size hint.
+#[op2(fast)]
+#[smi]
+pub fn op_readable_stream_resource_allocate_sized(
+  state: &mut OpState,
+  #[number] length: u64,
+) -> ResourceId {
+  let completion = CompletionHandle::default();
+  let resource = ReadableStreamResource {
+    read_queue: Default::default(),
+    cancel_handle: Default::default(),
+    channel: BoundedBufferChannel::default(),
+    data: ReadableStreamResourceData { completion },
+    size_hint: (length, Some(length)),
   };
   state.resource_table.add(resource)
 }
@@ -487,7 +525,7 @@ pub fn op_readable_stream_resource_write_buf(
 
 /// Write to the channel synchronously, returning 0 if the channel was closed, 1 if we wrote
 /// successfully, 2 if the channel was full and we need to block.
-#[op2(fast)]
+#[op2]
 pub fn op_readable_stream_resource_write_sync(
   sender: *const c_void,
   #[buffer] buffer: JsBuffer,
@@ -563,7 +601,7 @@ mod tests {
   static V8_GLOBAL: OnceLock<()> = OnceLock::new();
 
   thread_local! {
-    static ISOLATE: OnceCell<std::sync::Mutex<v8::OwnedIsolate>> = OnceCell::new();
+    static ISOLATE: OnceCell<std::sync::Mutex<v8::OwnedIsolate>> = const { OnceCell::new() };
   }
 
   fn with_isolate<T>(mut f: impl FnMut(&mut v8::Isolate) -> T) -> T {
@@ -619,7 +657,13 @@ mod tests {
     // Slightly slower reader
     let b = deno_core::unsync::spawn(async move {
       for _ in 0..BUFFER_CHANNEL_SIZE * 2 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        if cfg!(windows) {
+          // windows has ~15ms resolution on sleep, so just yield so
+          // this test doesn't take 30 seconds to run
+          tokio::task::yield_now().await;
+        } else {
+          tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         poll_fn(|cx| channel.poll_read_ready(cx)).await;
         channel.read(BUFFER_AGGREGATION_LIMIT).unwrap();
       }

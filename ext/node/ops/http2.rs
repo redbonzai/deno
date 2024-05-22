@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -12,6 +12,7 @@ use deno_core::futures::future::poll_fn;
 use deno_core::op2;
 use deno_core::serde::Serialize;
 use deno_core::AsyncRefCell;
+use deno_core::BufView;
 use deno_core::ByteString;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
@@ -24,17 +25,17 @@ use deno_net::raw::take_network_stream_resource;
 use deno_net::raw::NetworkStream;
 use h2;
 use h2::RecvStream;
-use http;
-use http::request::Parts;
-use http::HeaderMap;
-use http::Response;
-use http::StatusCode;
+use http_v02;
+use http_v02::request::Parts;
+use http_v02::HeaderMap;
+use http_v02::Response;
+use http_v02::StatusCode;
 use reqwest::header::HeaderName;
 use reqwest::header::HeaderValue;
 use url::Url;
 
 pub struct Http2Client {
-  pub client: AsyncRefCell<h2::client::SendRequest<Bytes>>,
+  pub client: AsyncRefCell<h2::client::SendRequest<BufView>>,
   pub url: Url,
 }
 
@@ -46,7 +47,7 @@ impl Resource for Http2Client {
 
 #[derive(Debug)]
 pub struct Http2ClientConn {
-  pub conn: AsyncRefCell<h2::client::Connection<NetworkStream>>,
+  pub conn: AsyncRefCell<h2::client::Connection<NetworkStream, BufView>>,
   cancel_handle: CancelHandle,
 }
 
@@ -63,7 +64,7 @@ impl Resource for Http2ClientConn {
 #[derive(Debug)]
 pub struct Http2ClientStream {
   pub response: AsyncRefCell<h2::client::ResponseFuture>,
-  pub stream: AsyncRefCell<h2::SendStream<Bytes>>,
+  pub stream: AsyncRefCell<h2::SendStream<BufView>>,
 }
 
 impl Resource for Http2ClientStream {
@@ -89,7 +90,7 @@ impl Resource for Http2ClientResponseBody {
 
 #[derive(Debug)]
 pub struct Http2ServerConnection {
-  pub conn: AsyncRefCell<h2::server::Connection<NetworkStream, Bytes>>,
+  pub conn: AsyncRefCell<h2::server::Connection<NetworkStream, BufView>>,
 }
 
 impl Resource for Http2ServerConnection {
@@ -99,7 +100,7 @@ impl Resource for Http2ServerConnection {
 }
 
 pub struct Http2ServerSendResponse {
-  pub send_response: AsyncRefCell<h2::server::SendResponse<Bytes>>,
+  pub send_response: AsyncRefCell<h2::server::SendResponse<BufView>>,
 }
 
 impl Resource for Http2ServerSendResponse {
@@ -123,7 +124,8 @@ pub async fn op_http2_connect(
 
   let url = Url::parse(&url)?;
 
-  let (client, conn) = h2::client::handshake(network_stream).await?;
+  let (client, conn) =
+    h2::client::Builder::new().handshake(network_stream).await?;
   let mut state = state.borrow_mut();
   let client_rid = state.resource_table.add(Http2Client {
     client: AsyncRefCell::new(client),
@@ -145,7 +147,7 @@ pub async fn op_http2_listen(
   let stream =
     take_network_stream_resource(&mut state.borrow_mut().resource_table, rid)?;
 
-  let conn = h2::server::handshake(stream).await?;
+  let conn = h2::server::Builder::new().handshake(stream).await?;
   Ok(
     state
       .borrow_mut()
@@ -308,7 +310,7 @@ pub async fn op_http2_client_request(
 
   let url = url.join(&pseudo_path)?;
 
-  let mut req = http::Request::builder()
+  let mut req = http_v02::Request::builder()
     .uri(url.as_str())
     .method(pseudo_method.as_str());
 
@@ -349,7 +351,7 @@ pub async fn op_http2_client_send_data(
   let mut stream = RcRef::map(&resource, |r| &r.stream).borrow_mut().await;
 
   // TODO(bartlomieju): handle end of stream
-  stream.send_data(bytes::Bytes::from(data), false)?;
+  stream.send_data(data.to_vec().into(), false)?;
   Ok(())
 }
 
@@ -365,7 +367,7 @@ pub async fn op_http2_client_end_stream(
   let mut stream = RcRef::map(&resource, |r| &r.stream).borrow_mut().await;
 
   // TODO(bartlomieju): handle end of stream
-  stream.send_data(bytes::Bytes::from(vec![]), true)?;
+  stream.send_data(BufView::empty(), true)?;
   Ok(())
 }
 
@@ -396,7 +398,7 @@ pub async fn op_http2_client_send_trailers(
     .get::<Http2ClientStream>(stream_rid)?;
   let mut stream = RcRef::map(&resource, |r| &r.stream).borrow_mut().await;
 
-  let mut trailers_map = http::HeaderMap::new();
+  let mut trailers_map = http_v02::HeaderMap::new();
   for (name, value) in trailers {
     trailers_map.insert(
       HeaderName::from_bytes(&name).unwrap(),
@@ -421,7 +423,7 @@ pub struct Http2ClientResponse {
 pub async fn op_http2_client_get_response(
   state: Rc<RefCell<OpState>>,
   #[smi] stream_rid: ResourceId,
-) -> Result<Http2ClientResponse, AnyError> {
+) -> Result<(Http2ClientResponse, bool), AnyError> {
   let resource = state
     .borrow()
     .resource_table
@@ -437,6 +439,7 @@ pub async fn op_http2_client_get_response(
   for (key, val) in parts.headers.iter() {
     res_headers.push((key.as_str().into(), val.as_bytes().into()));
   }
+  let end_stream = body.is_end_stream();
 
   let (trailers_tx, trailers_rx) = tokio::sync::oneshot::channel();
   let body_rid =
@@ -448,11 +451,14 @@ pub async fn op_http2_client_get_response(
         trailers_rx: AsyncRefCell::new(Some(trailers_rx)),
         trailers_tx: AsyncRefCell::new(Some(trailers_tx)),
       });
-  Ok(Http2ClientResponse {
-    headers: res_headers,
-    body_rid,
-    status_code: status.into(),
-  })
+  Ok((
+    Http2ClientResponse {
+      headers: res_headers,
+      body_rid,
+      status_code: status.into(),
+    },
+    end_stream,
+  ))
 }
 
 enum DataOrTrailers {
@@ -503,7 +509,6 @@ pub async fn op_http2_client_get_response_body_chunk(
         return Ok((Some(data.to_vec()), false));
       }
       DataOrTrailers::Trailers(trailers) => {
-        println!("{trailers:?}");
         if let Some(trailers_tx) = RcRef::map(&resource, |r| &r.trailers_tx)
           .borrow_mut()
           .await

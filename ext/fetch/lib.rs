@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
 mod fs_fetch_handler;
 
@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 
+use bytes::Bytes;
 use deno_core::anyhow::Error;
 use deno_core::error::type_error;
 use deno_core::error::AnyError;
@@ -21,13 +24,11 @@ use deno_core::futures::FutureExt;
 use deno_core::futures::Stream;
 use deno_core::futures::StreamExt;
 use deno_core::op2;
-use deno_core::BufView;
-use deno_core::WriteOutcome;
-
 use deno_core::unsync::spawn;
 use deno_core::url::Url;
 use deno_core::AsyncRefCell;
 use deno_core::AsyncResult;
+use deno_core::BufView;
 use deno_core::ByteString;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
@@ -43,8 +44,11 @@ use deno_tls::Proxy;
 use deno_tls::RootCertStoreProvider;
 
 use data_url::DataUrl;
-use http::header::CONTENT_LENGTH;
-use http::Uri;
+use deno_tls::TlsKey;
+use deno_tls::TlsKeys;
+use deno_tls::TlsKeysHolder;
+use http_v02::header::CONTENT_LENGTH;
+use http_v02::Uri;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderName;
 use reqwest::header::HeaderValue;
@@ -62,7 +66,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 
 // Re-export reqwest and data_url
 pub use data_url;
@@ -78,7 +81,7 @@ pub struct Options {
   pub request_builder_hook:
     Option<fn(RequestBuilder) -> Result<RequestBuilder, AnyError>>,
   pub unsafely_ignore_certificate_errors: Option<Vec<String>>,
-  pub client_cert_chain_and_key: Option<(String, String)>,
+  pub client_cert_chain_and_key: TlsKeys,
   pub file_fetch_handler: Rc<dyn FetchHandler>,
 }
 
@@ -99,7 +102,7 @@ impl Default for Options {
       proxy: None,
       request_builder_hook: None,
       unsafely_ignore_certificate_errors: None,
-      client_cert_chain_and_key: None,
+      client_cert_chain_and_key: TlsKeys::Null,
       file_fetch_handler: Rc::new(DefaultFileFetchHandler),
     }
   }
@@ -168,15 +171,6 @@ impl FetchHandler for DefaultFileFetchHandler {
   }
 }
 
-pub trait FetchPermissions {
-  fn check_net_url(
-    &mut self,
-    _url: &Url,
-    api_name: &str,
-  ) -> Result<(), AnyError>;
-  fn check_read(&mut self, _p: &Path, api_name: &str) -> Result<(), AnyError>;
-}
-
 pub fn get_declaration() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib.deno_fetch.d.ts")
 }
@@ -184,7 +178,6 @@ pub fn get_declaration() -> PathBuf {
 #[serde(rename_all = "camelCase")]
 pub struct FetchReturn {
   pub request_rid: ResourceId,
-  pub request_body_rid: Option<ResourceId>,
   pub cancel_handle_rid: Option<ResourceId>,
 }
 
@@ -195,25 +188,97 @@ pub fn get_or_create_client_from_state(
     Ok(client.clone())
   } else {
     let options = state.borrow::<Options>();
-    let client = create_http_client(
-      &options.user_agent,
-      CreateHttpClientOptions {
-        root_cert_store: options.root_cert_store()?,
-        ca_certs: vec![],
-        proxy: options.proxy.clone(),
-        unsafely_ignore_certificate_errors: options
-          .unsafely_ignore_certificate_errors
-          .clone(),
-        client_cert_chain_and_key: options.client_cert_chain_and_key.clone(),
-        pool_max_idle_per_host: None,
-        pool_idle_timeout: None,
-        http1: true,
-        http2: true,
-      },
-    )?;
+    let client = create_client_from_options(options)?;
     state.put::<reqwest::Client>(client.clone());
     Ok(client)
   }
+}
+
+pub fn create_client_from_options(
+  options: &Options,
+) -> Result<reqwest::Client, AnyError> {
+  create_http_client(
+    &options.user_agent,
+    CreateHttpClientOptions {
+      root_cert_store: options.root_cert_store()?,
+      ca_certs: vec![],
+      proxy: options.proxy.clone(),
+      unsafely_ignore_certificate_errors: options
+        .unsafely_ignore_certificate_errors
+        .clone(),
+      client_cert_chain_and_key: options
+        .client_cert_chain_and_key
+        .clone()
+        .try_into()
+        .unwrap_or_default(),
+      pool_max_idle_per_host: None,
+      pool_idle_timeout: None,
+      http1: true,
+      http2: true,
+    },
+  )
+}
+
+#[allow(clippy::type_complexity)]
+pub struct ResourceToBodyAdapter(
+  Rc<dyn Resource>,
+  Option<Pin<Box<dyn Future<Output = Result<BufView, Error>>>>>,
+);
+
+impl ResourceToBodyAdapter {
+  pub fn new(resource: Rc<dyn Resource>) -> Self {
+    let future = resource.clone().read(64 * 1024);
+    Self(resource, Some(future))
+  }
+}
+
+// SAFETY: we only use this on a single-threaded executor
+unsafe impl Send for ResourceToBodyAdapter {}
+// SAFETY: we only use this on a single-threaded executor
+unsafe impl Sync for ResourceToBodyAdapter {}
+
+impl Stream for ResourceToBodyAdapter {
+  type Item = Result<Bytes, Error>;
+
+  fn poll_next(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+  ) -> Poll<Option<Self::Item>> {
+    let this = self.get_mut();
+    if let Some(mut fut) = this.1.take() {
+      match fut.poll_unpin(cx) {
+        Poll::Pending => {
+          this.1 = Some(fut);
+          Poll::Pending
+        }
+        Poll::Ready(res) => match res {
+          Ok(buf) if buf.is_empty() => Poll::Ready(None),
+          Ok(_) => {
+            this.1 = Some(this.0.clone().read(64 * 1024));
+            Poll::Ready(Some(res.map(|b| b.to_vec().into())))
+          }
+          _ => Poll::Ready(Some(res.map(|b| b.to_vec().into()))),
+        },
+      }
+    } else {
+      Poll::Ready(None)
+    }
+  }
+}
+
+impl Drop for ResourceToBodyAdapter {
+  fn drop(&mut self) {
+    self.0.clone().close()
+  }
+}
+
+pub trait FetchPermissions {
+  fn check_net_url(
+    &mut self,
+    _url: &Url,
+    api_name: &str,
+  ) -> Result<(), AnyError>;
+  fn check_read(&mut self, _p: &Path, api_name: &str) -> Result<(), AnyError>;
 }
 
 #[op2]
@@ -226,8 +291,8 @@ pub fn op_fetch<FP>(
   #[serde] headers: Vec<(ByteString, ByteString)>,
   #[smi] client_rid: Option<u32>,
   has_body: bool,
-  #[number] body_length: Option<u64>,
   #[buffer] data: Option<JsBuffer>,
+  #[smi] resource: Option<ResourceId>,
 ) -> Result<FetchReturn, AnyError>
 where
   FP: FetchPermissions + 'static,
@@ -244,7 +309,7 @@ where
 
   // Check scheme before asking for net permission
   let scheme = url.scheme();
-  let (request_rid, request_body_rid, cancel_handle_rid) = match scheme {
+  let (request_rid, cancel_handle_rid) = match scheme {
     "file" => {
       let path = url.to_file_path().map_err(|_| {
         type_error("NetworkError when attempting to fetch resource.")
@@ -268,7 +333,7 @@ where
       let maybe_cancel_handle_rid = maybe_cancel_handle
         .map(|ch| state.resource_table.add(FetchCancelHandle(ch)));
 
-      (request_rid, None, maybe_cancel_handle_rid)
+      (request_rid, maybe_cancel_handle_rid)
     }
     "http" | "https" => {
       let permissions = state.borrow_mut::<FP>();
@@ -282,34 +347,25 @@ where
 
       let mut request = client.request(method.clone(), url);
 
-      let request_body_rid = if has_body {
-        match data {
-          None => {
-            // If no body is passed, we return a writer for streaming the body.
-            let (tx, stream) = tokio::sync::mpsc::channel(1);
-
-            // If the size of the body is known, we include a content-length
-            // header explicitly.
-            if let Some(body_size) = body_length {
-              request =
-                request.header(CONTENT_LENGTH, HeaderValue::from(body_size))
-            }
-
-            request = request.body(Body::wrap_stream(FetchBodyStream(stream)));
-
-            let request_body_rid =
-              state.resource_table.add(FetchRequestBodyResource {
-                body: AsyncRefCell::new(Some(tx)),
-                cancel: CancelHandle::default(),
-              });
-
-            Some(request_body_rid)
-          }
-          Some(data) => {
+      if has_body {
+        match (data, resource) {
+          (Some(data), _) => {
             // If a body is passed, we use it, and don't return a body for streaming.
             request = request.body(data.to_vec());
-            None
           }
+          (_, Some(resource)) => {
+            let resource = state.resource_table.take_any(resource)?;
+            match resource.size_hint() {
+              (body_size, Some(n)) if body_size == n && body_size > 0 => {
+                request =
+                  request.header(CONTENT_LENGTH, HeaderValue::from(body_size));
+              }
+              _ => {}
+            }
+            request = request
+              .body(Body::wrap_stream(ResourceToBodyAdapter::new(resource)))
+          }
+          (None, None) => unreachable!(),
         }
       } else {
         // POST and PUT requests should always have a 0 length content-length,
@@ -317,7 +373,6 @@ where
         if matches!(method, Method::POST | Method::PUT) {
           request = request.header(CONTENT_LENGTH, HeaderValue::from(0));
         }
-        None
       };
 
       let mut header_map = HeaderMap::new();
@@ -354,7 +409,7 @@ where
           .send()
           .or_cancel(cancel_handle_)
           .await
-          .map(|res| res.map_err(|err| type_error(err.to_string())))
+          .map(|res| res.map_err(|err| err.into()))
       };
 
       let request_rid = state
@@ -364,7 +419,7 @@ where
       let cancel_handle_rid =
         state.resource_table.add(FetchCancelHandle(cancel_handle));
 
-      (request_rid, request_body_rid, Some(cancel_handle_rid))
+      (request_rid, Some(cancel_handle_rid))
     }
     "data" => {
       let data_url = DataUrl::process(url.as_str())
@@ -374,9 +429,12 @@ where
         .decode_to_vec()
         .map_err(|e| type_error(format!("{e:?}")))?;
 
-      let response = http::Response::builder()
-        .status(http::StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, data_url.mime_type().to_string())
+      let response = http_v02::Response::builder()
+        .status(http_v02::StatusCode::OK)
+        .header(
+          http_v02::header::CONTENT_TYPE,
+          data_url.mime_type().to_string(),
+        )
         .body(reqwest::Body::from(body))?;
 
       let fut = async move { Ok(Ok(Response::from(response))) };
@@ -385,7 +443,7 @@ where
         .resource_table
         .add(FetchRequestResource(Box::pin(fut)));
 
-      (request_rid, None, None)
+      (request_rid, None)
     }
     "blob" => {
       // Blob URL resolution happens in the JS side of fetch. If we got here is
@@ -397,12 +455,11 @@ where
 
   Ok(FetchReturn {
     request_rid,
-    request_body_rid,
     cancel_handle_rid,
   })
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchResponse {
   pub status: u16,
@@ -413,6 +470,7 @@ pub struct FetchResponse {
   pub content_length: Option<u64>,
   pub remote_addr_ip: Option<String>,
   pub remote_addr_port: Option<u16>,
+  pub error: Option<String>,
 }
 
 #[op2(async)]
@@ -432,7 +490,29 @@ pub async fn op_fetch_send(
 
   let res = match request.0.await {
     Ok(Ok(res)) => res,
-    Ok(Err(err)) => return Err(type_error(err.to_string())),
+    Ok(Err(err)) => {
+      // We're going to try and rescue the error cause from a stream and return it from this fetch.
+      // If any error in the chain is a reqwest body error, return that as a special result we can use to
+      // reconstruct an error chain (eg: `new TypeError(..., { cause: new Error(...) })`).
+      // TODO(mmastrac): it would be a lot easier if we just passed a v8::Global through here instead
+      let mut err_ref: &dyn std::error::Error = err.as_ref();
+      while let Some(err) = std::error::Error::source(err_ref) {
+        if let Some(err) = err.downcast_ref::<reqwest::Error>() {
+          if err.is_body() {
+            // Extracts the next error cause and uses that for the message
+            if let Some(err) = std::error::Error::source(err) {
+              return Ok(FetchResponse {
+                error: Some(err.to_string()),
+                ..Default::default()
+              });
+            }
+          }
+        }
+        err_ref = err;
+      }
+
+      return Err(type_error(err.to_string()));
+    }
     Err(_) => return Err(type_error("request was cancelled")),
   };
 
@@ -465,6 +545,7 @@ pub async fn op_fetch_send(
     content_length,
     remote_addr_ip,
     remote_addr_port,
+    error: None,
   })
 }
 
@@ -599,74 +680,6 @@ impl Resource for FetchCancelHandle {
   }
 }
 
-/// Wraps a [`mpsc::Receiver`] in a [`Stream`] that can be used as a Hyper [`Body`].
-pub struct FetchBodyStream(pub mpsc::Receiver<Result<bytes::Bytes, Error>>);
-
-impl Stream for FetchBodyStream {
-  type Item = Result<bytes::Bytes, Error>;
-  fn poll_next(
-    mut self: Pin<&mut Self>,
-    cx: &mut std::task::Context<'_>,
-  ) -> std::task::Poll<Option<Self::Item>> {
-    self.0.poll_recv(cx)
-  }
-}
-
-pub struct FetchRequestBodyResource {
-  pub body: AsyncRefCell<Option<mpsc::Sender<Result<bytes::Bytes, Error>>>>,
-  pub cancel: CancelHandle,
-}
-
-impl Resource for FetchRequestBodyResource {
-  fn name(&self) -> Cow<str> {
-    "fetchRequestBody".into()
-  }
-
-  fn write(self: Rc<Self>, buf: BufView) -> AsyncResult<WriteOutcome> {
-    Box::pin(async move {
-      let bytes: bytes::Bytes = buf.into();
-      let nwritten = bytes.len();
-      let body = RcRef::map(&self, |r| &r.body).borrow_mut().await;
-      let body = (*body).as_ref();
-      let cancel = RcRef::map(self, |r| &r.cancel);
-      let body = body.ok_or(type_error(
-        "request body receiver not connected (request closed)",
-      ))?;
-      body.send(Ok(bytes)).or_cancel(cancel).await?.map_err(|_| {
-        type_error("request body receiver not connected (request closed)")
-      })?;
-      Ok(WriteOutcome::Full { nwritten })
-    })
-  }
-
-  fn write_error(self: Rc<Self>, error: Error) -> AsyncResult<()> {
-    async move {
-      let body = RcRef::map(&self, |r| &r.body).borrow_mut().await;
-      let body = (*body).as_ref();
-      let cancel = RcRef::map(self, |r| &r.cancel);
-      let body = body.ok_or(type_error(
-        "request body receiver not connected (request closed)",
-      ))?;
-      body.send(Err(error)).or_cancel(cancel).await??;
-      Ok(())
-    }
-    .boxed_local()
-  }
-
-  fn shutdown(self: Rc<Self>) -> AsyncResult<()> {
-    async move {
-      let mut body = RcRef::map(&self, |r| &r.body).borrow_mut().await;
-      body.take();
-      Ok(())
-    }
-    .boxed_local()
-  }
-
-  fn close(self: Rc<Self>) {
-    self.cancel.cancel();
-  }
-}
-
 type BytesStream =
   Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin>>;
 
@@ -789,22 +802,13 @@ impl HttpClientResource {
   }
 }
 
-#[derive(Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub enum PoolIdleTimeout {
-  State(bool),
-  Specify(u64),
-}
-
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateHttpClientArgs {
   ca_certs: Vec<String>,
   proxy: Option<Proxy>,
-  cert_chain: Option<String>,
-  private_key: Option<String>,
   pool_max_idle_per_host: Option<usize>,
-  pool_idle_timeout: Option<PoolIdleTimeout>,
+  pool_idle_timeout: Option<serde_json::Value>,
   #[serde(default = "default_true")]
   http1: bool,
   #[serde(default = "default_true")]
@@ -822,6 +826,7 @@ fn default_true() -> bool {
 pub fn op_fetch_custom_client<FP>(
   state: &mut OpState,
   #[serde] args: CreateHttpClientArgs,
+  #[cppgc] tls_keys: &TlsKeysHolder,
 ) -> Result<ResourceId, AnyError>
 where
   FP: FetchPermissions + 'static,
@@ -831,21 +836,6 @@ where
     let url = Url::parse(&proxy.url)?;
     permissions.check_net_url(&url, "Deno.createHttpClient()")?;
   }
-
-  let client_cert_chain_and_key = {
-    if args.cert_chain.is_some() || args.private_key.is_some() {
-      let cert_chain = args
-        .cert_chain
-        .ok_or_else(|| type_error("No certificate chain provided"))?;
-      let private_key = args
-        .private_key
-        .ok_or_else(|| type_error("No private key provided"))?;
-
-      Some((cert_chain, private_key))
-    } else {
-      None
-    }
-  };
 
   let options = state.borrow::<Options>();
   let ca_certs = args
@@ -863,13 +853,16 @@ where
       unsafely_ignore_certificate_errors: options
         .unsafely_ignore_certificate_errors
         .clone(),
-      client_cert_chain_and_key,
+      client_cert_chain_and_key: tls_keys.take().try_into().unwrap(),
       pool_max_idle_per_host: args.pool_max_idle_per_host,
       pool_idle_timeout: args.pool_idle_timeout.and_then(
         |timeout| match timeout {
-          PoolIdleTimeout::State(true) => None,
-          PoolIdleTimeout::State(false) => Some(None),
-          PoolIdleTimeout::Specify(specify) => Some(Some(specify)),
+          serde_json::Value::Bool(true) => None,
+          serde_json::Value::Bool(false) => Some(None),
+          serde_json::Value::Number(specify) => {
+            Some(Some(specify.as_u64().unwrap_or_default()))
+          }
+          _ => Some(None),
         },
       ),
       http1: args.http1,
@@ -889,7 +882,7 @@ pub struct CreateHttpClientOptions {
   pub ca_certs: Vec<Vec<u8>>,
   pub proxy: Option<Proxy>,
   pub unsafely_ignore_certificate_errors: Option<Vec<String>>,
-  pub client_cert_chain_and_key: Option<(String, String)>,
+  pub client_cert_chain_and_key: Option<TlsKey>,
   pub pool_max_idle_per_host: Option<usize>,
   pub pool_idle_timeout: Option<Option<u64>>,
   pub http1: bool,
@@ -922,7 +915,7 @@ pub fn create_http_client(
     options.root_cert_store,
     options.ca_certs,
     options.unsafely_ignore_certificate_errors,
-    options.client_cert_chain_and_key,
+    options.client_cert_chain_and_key.into(),
     deno_tls::SocketUse::Http,
   )?;
 

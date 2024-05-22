@@ -1,10 +1,9 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 // Copyright Joyent and Node contributors. All rights reserved. MIT license.
 
 // TODO(petamoriken): enable prefer-primordials for node polyfills
 // deno-lint-ignore-file prefer-primordials
 
-const core = globalThis.__bootstrap.core;
 import { getDefaultHighWaterMark } from "ext:deno_node/internal/streams/state.mjs";
 import assert from "ext:deno_node/internal/assert.mjs";
 import EE from "node:events";
@@ -250,7 +249,7 @@ export class OutgoingMessage extends Stream {
     }
 
     name = name.toString();
-    headers[name.toLowerCase()] = [name, value.toString()];
+    headers[name.toLowerCase()] = [name, String(value)];
     return this;
   }
 
@@ -544,7 +543,7 @@ export class OutgoingMessage extends Stream {
       data = new Uint8Array(data.buffer);
     }
     if (data.buffer.byteLength > 0) {
-      core.writeAll(this._bodyWriteRid, data).then(() => {
+      this._bodyWriter.write(data).then(() => {
         callback?.();
         this.emit("drain");
       }).catch((e) => {
@@ -821,21 +820,25 @@ Object.defineProperty(OutgoingMessage.prototype, "_headerNames", {
   ),
 });
 
-export const validateHeaderName = hideStackFrames((name) => {
-  if (typeof name !== "string" || !name || !checkIsHttpToken(name)) {
-    throw new ERR_INVALID_HTTP_TOKEN("Header name", name);
-  }
-});
+export const validateHeaderName = hideStackFrames(
+  (name: string, label?: string): void => {
+    if (typeof name !== "string" || !name || !checkIsHttpToken(name)) {
+      throw new ERR_INVALID_HTTP_TOKEN(label || "Header name", name);
+    }
+  },
+);
 
-export const validateHeaderValue = hideStackFrames((name, value) => {
-  if (value === undefined) {
-    throw new ERR_HTTP_INVALID_HEADER_VALUE(value, name);
-  }
-  if (checkInvalidHeaderChar(value)) {
-    debug('Header "%s" contains invalid characters', name);
-    throw new ERR_INVALID_CHAR("header content", name);
-  }
-});
+export const validateHeaderValue = hideStackFrames(
+  (name: string, value: string): void => {
+    if (value === undefined) {
+      throw new ERR_HTTP_INVALID_HEADER_VALUE(value, name);
+    }
+    if (checkInvalidHeaderChar(value)) {
+      debug('Header "%s" contains invalid characters', name);
+      throw new ERR_INVALID_CHAR("header content", name);
+    }
+  },
+);
 
 export function parseUniqueHeadersOption(headers) {
   if (!Array.isArray(headers)) {

@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 // Copyright Node.js contributors. All rights reserved. MIT License.
 
 // TODO(petamoriken): enable prefer-primordials for node polyfills
@@ -17,6 +17,8 @@
  * ERR_INVALID_PACKAGE_CONFIG // package.json stuff, probably useless
  */
 
+import { primordials } from "ext:core/mod.js";
+const { JSONStringify } = primordials;
 import { format, inspect } from "ext:deno_node/internal/util/inspect.mjs";
 import { codes } from "ext:deno_node/internal/error_codes.ts";
 import {
@@ -2248,6 +2250,16 @@ export class ERR_FALSY_VALUE_REJECTION extends NodeError {
     this.reason = reason;
   }
 }
+
+export class ERR_HTTP2_TOO_MANY_CUSTOM_SETTINGS extends NodeError {
+  constructor() {
+    super(
+      "ERR_HTTP2_TOO_MANY_CUSTOM_SETTINGS",
+      "Number of custom settings exceeds MAX_ADDITIONAL_SETTINGS",
+    );
+  }
+}
+
 export class ERR_HTTP2_INVALID_SETTING_VALUE extends NodeRangeError {
   actual: unknown;
   min?: number;
@@ -2472,6 +2484,36 @@ export class ERR_PACKAGE_PATH_NOT_EXPORTED extends NodeError {
   }
 }
 
+export class ERR_PARSE_ARGS_INVALID_OPTION_VALUE extends NodeTypeError {
+  constructor(x: string) {
+    super("ERR_PARSE_ARGS_INVALID_OPTION_VALUE", x);
+  }
+}
+
+export class ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL extends NodeTypeError {
+  constructor(x: string) {
+    super(
+      "ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL",
+      `Unexpected argument '${x}'. This ` +
+        `command does not take positional arguments`,
+    );
+  }
+}
+
+export class ERR_PARSE_ARGS_UNKNOWN_OPTION extends NodeTypeError {
+  constructor(option, allowPositionals) {
+    const suggestDashDash = allowPositionals
+      ? ". To specify a positional " +
+        "argument starting with a '-', place it at the end of the command after " +
+        `'--', as in '-- ${JSONStringify(option)}`
+      : "";
+    super(
+      "ERR_PARSE_ARGS_UNKNOWN_OPTION",
+      `Unknown option '${option}'${suggestDashDash}`,
+    );
+  }
+}
+
 export class ERR_INTERNAL_ASSERTION extends NodeError {
   constructor(message?: string) {
     const suffix = "This is caused by either a bug in Node.js " +
@@ -2510,6 +2552,21 @@ export class ERR_OS_NO_HOMEDIR extends NodeSystemError {
       errno: isWindows ? osConstants.errno.ENOENT : osConstants.errno.ENOTDIR,
     };
     super(code, ctx, "Path is not a directory");
+  }
+}
+
+export class ERR_HTTP_SOCKET_ASSIGNED extends NodeError {
+  constructor() {
+    super(
+      "ERR_HTTP_SOCKET_ASSIGNED",
+      `ServerResponse has an already assigned socket`,
+    );
+  }
+}
+
+export class ERR_INVALID_STATE extends NodeError {
+  constructor(message: string) {
+    super("ERR_INVALID_STATE", `Invalid state: ${message}`);
   }
 }
 
@@ -2580,6 +2637,11 @@ codes.ERR_OUT_OF_RANGE = ERR_OUT_OF_RANGE;
 codes.ERR_SOCKET_BAD_PORT = ERR_SOCKET_BAD_PORT;
 codes.ERR_BUFFER_OUT_OF_BOUNDS = ERR_BUFFER_OUT_OF_BOUNDS;
 codes.ERR_UNKNOWN_ENCODING = ERR_UNKNOWN_ENCODING;
+codes.ERR_PARSE_ARGS_INVALID_OPTION_VALUE = ERR_PARSE_ARGS_INVALID_OPTION_VALUE;
+codes.ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL =
+  ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL;
+codes.ERR_PARSE_ARGS_UNKNOWN_OPTION = ERR_PARSE_ARGS_UNKNOWN_OPTION;
+
 // TODO(kt3k): assign all error classes here.
 
 /**
@@ -2768,6 +2830,7 @@ export default {
   ERR_INVALID_RETURN_PROPERTY,
   ERR_INVALID_RETURN_PROPERTY_VALUE,
   ERR_INVALID_RETURN_VALUE,
+  ERR_INVALID_STATE,
   ERR_INVALID_SYNC_FORK_INPUT,
   ERR_INVALID_THIS,
   ERR_INVALID_TUPLE,
@@ -2797,6 +2860,7 @@ export default {
   ERR_OUT_OF_RANGE,
   ERR_PACKAGE_IMPORT_NOT_DEFINED,
   ERR_PACKAGE_PATH_NOT_EXPORTED,
+  ERR_PARSE_ARGS_INVALID_OPTION_VALUE,
   ERR_QUICCLIENTSESSION_FAILED,
   ERR_QUICCLIENTSESSION_FAILED_SETSOCKET,
   ERR_QUICSESSION_DESTROYED,
